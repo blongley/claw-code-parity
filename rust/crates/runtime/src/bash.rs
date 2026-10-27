@@ -1,12 +1,9 @@
 use std::env;
 use std::io;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command as TokioCommand;
-use tokio::runtime::Builder;
-use tokio::time::timeout;
 
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
@@ -67,9 +64,16 @@ pub struct BashCommandOutput {
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    let BashCommandInput {
+        command,
+        timeout,
+        run_in_background,
+        dangerously_disable_sandbox,
+        ..
+    } = input;
 
-    if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
+    if run_in_background.unwrap_or(false) {
+        let mut child = prepare_command(&command, &cwd, &sandbox_status, false);
         let child = child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -85,7 +89,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
             background_task_id: Some(child.id().to_string()),
             backgrounded_by_user: Some(false),
             assistant_auto_backgrounded: Some(false),
-            dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+            dangerously_disable_sandbox,
             return_code_interpretation: None,
             no_output_expected: Some(true),
             structured_content: None,
@@ -95,45 +99,90 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
-    let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    let mut prepared = prepare_command(&command, &cwd, &sandbox_status, true);
+    if let Some(timeout_ms) = timeout {
+        execute_with_timeout(
+            prepared,
+            timeout_ms,
+            dangerously_disable_sandbox,
+            sandbox_status,
+        )
+    } else {
+        let output = prepared.output()?;
+        Ok(completed_output(
+            &output,
+            dangerously_disable_sandbox,
+            sandbox_status,
+        ))
+    }
 }
 
-async fn execute_bash_async(
-    input: BashCommandInput,
+fn execute_with_timeout(
+    mut command: Command,
+    timeout_ms: u64,
+    dangerously_disable_sandbox: Option<bool>,
     sandbox_status: SandboxStatus,
-    cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // `sh -lc` forks the requested program. Killing only the shell leaves that
+    // child holding the output pipes, so the wait would run until the command
+    // finished on its own. A private process group lets the timeout signal the
+    // whole tree.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let started = Instant::now();
+    let mut child = command.spawn()?;
+    let timeout = Duration::from_millis(timeout_ms);
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            Ok(result) => (result?, false),
-            Err(_) => {
-                return Ok(BashCommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: Some(sandbox_status),
-                });
-            }
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            return Ok(completed_output(
+                &output,
+                dangerously_disable_sandbox,
+                sandbox_status,
+            ));
         }
-    } else {
-        (command.output().await?, false)
-    };
+        if started.elapsed() >= timeout {
+            terminate_child(&mut child);
+            let output = child.wait_with_output()?;
+            return Ok(timed_out_output(
+                &output,
+                timeout_ms,
+                dangerously_disable_sandbox,
+                sandbox_status,
+            ));
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        std::thread::sleep(Duration::from_millis(10).min(remaining));
+    }
+}
 
-    let (output, interrupted) = output_result;
+fn terminate_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    let id = child.id();
+    let _ = child.kill();
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{id}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn completed_output(
+    output: &Output,
+    dangerously_disable_sandbox: Option<bool>,
+    sandbox_status: SandboxStatus,
+) -> BashCommandOutput {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
@@ -145,23 +194,59 @@ async fn execute_bash_async(
         }
     });
 
-    Ok(BashCommandOutput {
+    BashCommandOutput {
         stdout,
         stderr,
         raw_output_path: None,
-        interrupted,
+        interrupted: false,
         is_image: None,
         background_task_id: None,
         backgrounded_by_user: None,
         assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        dangerously_disable_sandbox,
         return_code_interpretation,
         no_output_expected,
         structured_content: None,
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
-    })
+    }
+}
+
+fn timed_out_output(
+    output: &Output,
+    timeout_ms: u64,
+    dangerously_disable_sandbox: Option<bool>,
+    sandbox_status: SandboxStatus,
+) -> BashCommandOutput {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let captured_stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = if captured_stderr.trim().is_empty() {
+        format!("Command exceeded timeout of {timeout_ms} ms")
+    } else {
+        format!(
+            "{}\nCommand exceeded timeout of {timeout_ms} ms",
+            captured_stderr.trim_end()
+        )
+    };
+
+    BashCommandOutput {
+        stdout,
+        stderr,
+        raw_output_path: None,
+        interrupted: true,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox,
+        return_code_interpretation: Some(String::from("timeout")),
+        no_output_expected: Some(true),
+        structured_content: None,
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: Some(sandbox_status),
+    }
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
@@ -206,33 +291,6 @@ fn prepare_command(
     prepared
 }
 
-fn prepare_tokio_command(
-    command: &str,
-    cwd: &std::path::Path,
-    sandbox_status: &SandboxStatus,
-    create_dirs: bool,
-) -> TokioCommand {
-    if create_dirs {
-        prepare_sandbox_dirs(cwd);
-    }
-
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = TokioCommand::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
-    }
-
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
-    }
-    prepared
-}
-
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
@@ -257,6 +315,27 @@ mod tests {
             allowed_mounts: None,
         })
         .expect("bash command should execute");
+
+        assert_eq!(output.stdout, "hello");
+        assert!(!output.interrupted);
+        assert!(output.sandbox_status.is_some());
+    }
+
+    #[test]
+    fn default_sandbox_returns_command_stdout() {
+        let _guard = crate::test_env_lock();
+        let output = execute_bash(BashCommandInput {
+            command: String::from("printf 'hello'"),
+            timeout: None,
+            description: None,
+            run_in_background: None,
+            dangerously_disable_sandbox: None,
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("default sandbox should still run the command");
 
         assert_eq!(output.stdout, "hello");
         assert!(!output.interrupted);
@@ -297,9 +376,15 @@ mod tests {
 
     #[test]
     fn times_out_and_records_nonzero_exit_codes() {
+        let started = std::time::Instant::now();
         let timed_out = execute_bash(unsandboxed("sleep 5", Some(200), false))
             .expect("timed out command should return");
         assert!(timed_out.interrupted);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "timeout returned only after {:?}, so the child kept the pipes open",
+            started.elapsed()
+        );
         assert_eq!(
             timed_out.return_code_interpretation.as_deref(),
             Some("timeout")
