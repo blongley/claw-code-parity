@@ -339,7 +339,14 @@ impl CommandWithStdin {
         let mut child = self.command.spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
             use std::io::Write as _;
-            child_stdin.write_all(stdin)?;
+            // Hooks may exit without reading stdin. A closed pipe is not a startup failure.
+            if let Err(error) = child_stdin.write_all(stdin) {
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    drop(child_stdin);
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
         }
         child.wait_with_output()
     }
@@ -497,5 +504,23 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message == "later plugin hook"));
+    }
+
+    #[test]
+    fn closed_stdin_does_not_fail_a_large_hook_payload() {
+        let mut command = super::shell_command("exec 0<&-; printf 'closed stdin'");
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+
+        let output = command
+            .output_with_stdin(&vec![b'x'; 128 * 1024])
+            .expect("a hook that closes stdin should still be collected");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "closed stdin"
+        );
     }
 }

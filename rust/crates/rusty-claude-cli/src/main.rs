@@ -501,7 +501,7 @@ fn format_unknown_slash_command(name: &str) -> String {
 }
 
 fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String> {
-    (!suggestions.is_empty()).then(|| format!("  {label:<16} {}", suggestions.join(", "),))
+    (!suggestions.is_empty()).then(|| format!("  {label:<16} {}", suggestions.join(", ")))
 }
 
 fn suggest_slash_commands(input: &str) -> Vec<String> {
@@ -3099,7 +3099,7 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
             } else {
                 preview
             };
-            lines.push(format!("  {}. {}", index + 1, file.path.display(),));
+            lines.push(format!("  {}. {}", index + 1, file.path.display()));
             lines.push(format!(
                 "     lines={} preview={}",
                 file.content.lines().count(),
@@ -3367,8 +3367,7 @@ fn command_exists(name: &str) -> bool {
     Command::new("which")
         .arg(name)
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn write_temp_text_file(
@@ -6778,7 +6777,7 @@ UU conflicted.rs",
         )
         .expect("tool block should accumulate");
 
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [runtime::AssistantEvent; 0]);
         assert_eq!(
             pending_tool,
             Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))

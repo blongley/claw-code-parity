@@ -355,4 +355,41 @@ mod tests {
     fn escapes_control_characters() {
         assert_eq!(render_string("a\n\t\"b"), "\"a\\n\\t\\\"b\"");
     }
+
+    #[test]
+    fn parses_nested_values_and_rejects_malformed_documents() {
+        let parsed = JsonValue::parse("[-2, {}, [], true, null]").expect("nested json");
+        let values = parsed.as_array().expect("array");
+        assert_eq!(values[0].as_i64(), Some(-2));
+        assert!(values[1].as_object().is_some());
+        assert_eq!(values[2].as_array().expect("array").len(), 0);
+        assert_eq!(values[3].as_bool(), Some(true));
+        assert!(values[4].as_str().is_none());
+        assert!(values[4].as_bool().is_none());
+        assert!(values[4].as_i64().is_none());
+
+        let escaped = JsonValue::parse(r#""a\u0041""#).expect("unicode escape");
+        assert_eq!(escaped.as_str(), Some("aA"));
+
+        assert!(JsonValue::parse("")
+            .unwrap_err()
+            .to_string()
+            .contains("end of input"));
+        assert!(JsonValue::parse("true trailing")
+            .unwrap_err()
+            .to_string()
+            .contains("trailing"));
+        assert!(JsonValue::parse("nul")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid literal"));
+        assert!(JsonValue::parse("\"unterminated")
+            .unwrap_err()
+            .to_string()
+            .contains("unterminated"));
+        assert!(JsonValue::parse("99999999999999999999")
+            .unwrap_err()
+            .to_string()
+            .contains("out of range"));
+    }
 }

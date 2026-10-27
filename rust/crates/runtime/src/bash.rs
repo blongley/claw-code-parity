@@ -280,4 +280,54 @@ mod tests {
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
     }
+
+    fn unsandboxed(command: &str, timeout: Option<u64>, background: bool) -> BashCommandInput {
+        BashCommandInput {
+            command: command.to_string(),
+            timeout,
+            description: None,
+            run_in_background: Some(background),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        }
+    }
+
+    #[test]
+    fn times_out_and_records_nonzero_exit_codes() {
+        let timed_out = execute_bash(unsandboxed("sleep 5", Some(200), false))
+            .expect("timed out command should return");
+        assert!(timed_out.interrupted);
+        assert_eq!(
+            timed_out.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert!(timed_out.stderr.contains("timeout"));
+
+        let failed =
+            execute_bash(unsandboxed("exit 7", Some(1_000), false)).expect("exit should return");
+        assert!(!failed.interrupted);
+        assert_eq!(
+            failed.return_code_interpretation.as_deref(),
+            Some("exit_code:7")
+        );
+        assert_eq!(failed.no_output_expected, Some(true));
+    }
+
+    #[test]
+    fn returns_background_task_without_waiting_for_output() {
+        let output = execute_bash(unsandboxed("sleep 30", None, true))
+            .expect("background command should spawn");
+        let pid = output
+            .background_task_id
+            .expect("background task id should be recorded");
+        let _ = std::process::Command::new("kill").arg(&pid).status();
+
+        assert_eq!(output.stdout, "");
+        assert_eq!(output.no_output_expected, Some(true));
+        assert!(!output.interrupted);
+        assert!(output.sandbox_status.is_some());
+    }
 }

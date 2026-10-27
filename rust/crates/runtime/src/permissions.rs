@@ -672,4 +672,79 @@ mod tests {
             Some("hook requested confirmation")
         );
     }
+
+    #[test]
+    fn hook_deny_without_reason_uses_default_message() {
+        let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess);
+        let context = PermissionContext::new(Some(PermissionOverride::Deny), None);
+
+        assert_eq!(
+            policy.authorize_with_context("bash", "{}", &context, None),
+            PermissionOutcome::Deny {
+                reason: "tool 'bash' denied by hook".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn denies_escalation_when_no_prompter_is_available() {
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+
+        assert!(matches!(
+            policy.authorize("bash", "echo hi", None),
+            PermissionOutcome::Deny { reason }
+                if reason.contains("requires approval to escalate from workspace-write to danger-full-access")
+        ));
+    }
+
+    #[test]
+    fn exact_allow_rule_does_not_prefix_match() {
+        let rules = RuntimePermissionRuleConfig::new(
+            vec!["bash(git status)".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"git status"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"git status --short"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn bare_tool_allow_rule_matches_any_input() {
+        let rules =
+            RuntimePermissionRuleConfig::new(vec!["bash".to_string()], Vec::new(), Vec::new());
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"rm -rf /tmp"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("write_file", r#"{"path":"x"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn allow_mode_permits_tools_below_its_rank() {
+        let policy = PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+
+        assert_eq!(
+            policy.authorize("bash", "{}", None),
+            PermissionOutcome::Allow
+        );
+    }
 }

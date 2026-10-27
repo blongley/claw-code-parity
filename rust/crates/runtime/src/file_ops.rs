@@ -547,4 +547,37 @@ mod tests {
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
     }
+
+    #[test]
+    fn rejects_missing_reads_and_invalid_edits() {
+        let missing = temp_path("missing.txt");
+        let read_error = read_file(missing.to_string_lossy().as_ref(), None, None)
+            .expect_err("missing file should fail");
+        assert_eq!(read_error.kind(), std::io::ErrorKind::NotFound);
+
+        let path = temp_path("edit-errors.txt");
+        let path_str = path.to_string_lossy();
+        write_file(path_str.as_ref(), "alpha beta alpha").expect("seed file");
+
+        let identical = edit_file(path_str.as_ref(), "alpha", "alpha", false)
+            .expect_err("identical replacement should fail");
+        assert_eq!(identical.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(identical.to_string().contains("must differ"));
+
+        let absent = edit_file(path_str.as_ref(), "missing", "x", false)
+            .expect_err("unknown old_string should fail");
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
+
+        let once = edit_file(path_str.as_ref(), "alpha", "omega", false).expect("first edit");
+        assert!(!once.replace_all);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read edited file"),
+            "omega beta alpha"
+        );
+
+        let updated = write_file(path_str.as_ref(), "rewritten").expect("update");
+        assert_eq!(updated.kind, "update");
+        assert_eq!(updated.original_file.as_deref(), Some("omega beta alpha"));
+        let _ = std::fs::remove_file(path);
+    }
 }
