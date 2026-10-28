@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Read};
@@ -135,14 +137,14 @@ fn execute_with_timeout(
     dangerously_disable_sandbox: Option<bool>,
     sandbox_status: SandboxStatus,
 ) -> io::Result<BashCommandOutput> {
-    // A pid namespace makes `setsid` descendants children of the supervisor
-    // (pid 1). The supervisor reaps them and exits only after they do; killing
-    // the supervisor tears the namespace down, so a new session cannot outlive
-    // the deadline. Stdout and stderr are drained concurrently so a full pipe
-    // cannot stall the command past that deadline.
-    let supervise_in_pid_namespace = pid_namespace_supervisor_available();
-    if supervise_in_pid_namespace {
-        command = command_in_pid_namespace(&command);
+    // Detached descendants (`setsid`, a new process group) leave the shell's
+    // process group. A pid-namespace supervisor keeps them in one tree and
+    // reaps them. Where that namespace is unavailable, a child subreaper
+    // adopts the orphans so the deadline can still kill them. Stdout and
+    // stderr are drained concurrently so a full pipe cannot stall the command.
+    let supervision = supervision_mode();
+    if let Some(supervised) = supervised_command(&command, supervision) {
+        command = supervised;
     }
     command
         .stdin(Stdio::null())
@@ -156,13 +158,12 @@ fn execute_with_timeout(
     let stdout_reader = spawn_reader(child.stdout.take());
     let stderr_reader = spawn_reader(child.stderr.take());
     let timeout = Duration::from_millis(timeout_ms);
-    let wait_result = if supervise_in_pid_namespace {
-        wait_for_child(&mut child, timeout)
-    } else {
-        wait_for_process_group(&mut child, timeout)
+    let wait_result = match supervision {
+        Supervision::ProcessGroup => wait_for_process_group(&mut child, timeout),
+        Supervision::PidNamespace | Supervision::Subreaper => wait_for_child(&mut child, timeout),
     };
     if wait_result.is_err() {
-        terminate_process_group(&mut child, false);
+        terminate_child_tree(&mut child, false);
     }
     let stdout = join_reader(stdout_reader);
     let stderr = join_reader(stderr_reader);
@@ -243,6 +244,34 @@ wait || true
 exit "$status"
 "#;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Supervision {
+    PidNamespace,
+    Subreaper,
+    ProcessGroup,
+}
+
+fn supervision_mode() -> Supervision {
+    // A child subreaper does not need a user namespace. Hosts that block
+    // unprivileged `unshare --user` still adopt `setsid` orphans this way.
+    // The pid namespace is the fallback when Python cannot call prctl.
+    if subreaper_supervisor_available() {
+        Supervision::Subreaper
+    } else if pid_namespace_supervisor_available() {
+        Supervision::PidNamespace
+    } else {
+        Supervision::ProcessGroup
+    }
+}
+
+fn supervised_command(command: &Command, supervision: Supervision) -> Option<Command> {
+    match supervision {
+        Supervision::PidNamespace => Some(command_in_pid_namespace(command)),
+        Supervision::Subreaper => Some(command_in_subreaper(command)),
+        Supervision::ProcessGroup => None,
+    }
+}
+
 fn pid_namespace_supervisor_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -267,14 +296,114 @@ fn pid_namespace_supervisor_available() -> bool {
     })
 }
 
+/// `PR_SET_CHILD_SUBREAPER`. Orphans of the command are reparented here instead
+/// of to init, including processes that called `setsid`.
+const SUBREAPER_SUPERVISOR: &str = r#"
+import ctypes, os, signal, subprocess, sys, time
+PR_SET_CHILD_SUBREAPER = 36
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+    raise SystemExit(127)
+target = sys.argv[1]
+child = subprocess.Popen(["sh", "-c", target])
+shell_status = None
+
+def reap():
+    global shell_status
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+        if pid == child.pid and shell_status is None:
+            shell_status = os.waitstatus_to_exitcode(status)
+
+def read_stat(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    marker = data.rfind(")")
+    if marker < 0:
+        return None
+    fields = data[marker + 1:].split()
+    if len(fields) < 3:
+        return None
+    return fields[0], int(fields[1])
+
+def live_descendants():
+    root = os.getpid()
+    info = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        parsed = read_stat(int(name))
+        if parsed is not None:
+            info[int(name)] = parsed
+    live = []
+    for pid, (state, _ppid) in info.items():
+        if state == "Z" or pid == root:
+            continue
+        seen = set()
+        current = pid
+        while current not in seen:
+            seen.add(current)
+            parent = info.get(current, (None, None))[1]
+            if parent in (None, 0, current):
+                break
+            if parent == root:
+                live.append(pid)
+                break
+            current = parent
+    return live
+
+def kill_descendants():
+    for pid in live_descendants():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.kill(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    reap()
+
+def on_term(_signum, _frame):
+    kill_descendants()
+    raise SystemExit(128 + signal.SIGTERM)
+
+signal.signal(signal.SIGTERM, on_term)
+while True:
+    reap()
+    if shell_status is not None and not live_descendants():
+        reap()
+        raise SystemExit(shell_status if 0 <= shell_status < 256 else 128)
+    time.sleep(0.01)
+"#;
+
+fn subreaper_supervisor_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("python3")
+            .args([
+                "-c",
+                "import ctypes,sys\nlibc=ctypes.CDLL(None, use_errno=True)\nsys.exit(0 if libc.prctl(36, 1, 0, 0, 0) == 0 else 1)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
 fn command_in_pid_namespace(command: &Command) -> Command {
     let line = command_line(command);
-    let current_dir = command.get_current_dir().map(PathBuf::from);
-    let envs = command
-        .get_envs()
-        .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
-        .collect::<Vec<_>>();
-    let mut supervised = Command::new("unshare");
+    let mut supervised = command_with_context("unshare", command);
     supervised.args([
         "--user",
         "--map-root-user",
@@ -289,20 +418,37 @@ fn command_in_pid_namespace(command: &Command) -> Command {
         "sh",
         &line,
     ]);
+    supervised
+}
+
+fn command_in_subreaper(command: &Command) -> Command {
+    let line = command_line(command);
+    let mut supervised = command_with_context("python3", command);
+    supervised.args(["-c", SUBREAPER_SUPERVISOR, &line]);
+    supervised
+}
+
+fn command_with_context(program: &str, source: &Command) -> Command {
+    let current_dir = source.get_current_dir().map(PathBuf::from);
+    let envs = source
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+        .collect::<Vec<_>>();
+    let mut command = Command::new(program);
     if let Some(dir) = current_dir {
-        supervised.current_dir(dir);
+        command.current_dir(dir);
     }
     for (key, value) in envs {
         match value {
             Some(value) => {
-                supervised.env(key, value);
+                command.env(key, value);
             }
             None => {
-                supervised.env_remove(key);
+                command.env_remove(key);
             }
         }
     }
-    supervised
+    command
 }
 
 fn command_line(command: &Command) -> String {
@@ -325,7 +471,7 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> io::Result<Option<Exi
             return Ok(Some(status));
         }
         if started.elapsed() >= timeout {
-            terminate_process_group(child, false);
+            terminate_child_tree(child, false);
             return Ok(None);
         }
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -350,12 +496,83 @@ fn wait_for_process_group(child: &mut Child, timeout: Duration) -> io::Result<Op
             return Ok(exit_status);
         }
         if started.elapsed() >= timeout {
-            terminate_process_group(child, exit_status.is_some());
+            terminate_child_tree(child, exit_status.is_some());
             return Ok(None);
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         thread::sleep(Duration::from_millis(10).min(remaining));
     }
+}
+
+fn terminate_child_tree(child: &mut Child, shell_reaped: bool) {
+    #[cfg(target_os = "linux")]
+    kill_linux_descendants(child.id());
+    terminate_process_group(child, shell_reaped);
+}
+
+#[cfg(target_os = "linux")]
+fn kill_linux_descendants(root: u32) {
+    for _ in 0..2 {
+        let pids = descendant_pids(root);
+        if pids.is_empty() {
+            break;
+        }
+        for pid in pids {
+            signal_kill(pid);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let mut parents = HashMap::<u32, u32>::new();
+    let mut states = HashMap::<u32, String>::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let (Some(state), Some(parent)) = (process_state(&stat), parent_pid(&stat)) else {
+            continue;
+        };
+        parents.insert(pid, parent);
+        states.insert(pid, state.to_string());
+    }
+
+    let mut live = Vec::new();
+    for (pid, state) in &states {
+        if state == "Z" || *pid == root {
+            continue;
+        }
+        let mut current = *pid;
+        let mut seen = HashSet::new();
+        while seen.insert(current) {
+            let Some(parent) = parents.get(&current).copied() else {
+                break;
+            };
+            if parent == root {
+                live.push(*pid);
+                break;
+            }
+            if parent == 0 || parent == current {
+                break;
+            }
+            current = parent;
+        }
+    }
+    live
 }
 
 fn terminate_process_group(child: &mut Child, shell_reaped: bool) {
@@ -370,8 +587,18 @@ fn terminate_process_group(child: &mut Child, shell_reaped: bool) {
 #[cfg(unix)]
 fn signal_process_group(group_id: u32) {
     let group = format!("-{group_id}");
+    signal_kill_arg(&group);
+}
+
+#[cfg(target_os = "linux")]
+fn signal_kill(pid: u32) {
+    signal_kill_arg(&pid.to_string());
+}
+
+#[cfg(unix)]
+fn signal_kill_arg(target: &str) {
     let _ = Command::new("kill")
-        .args(["-KILL", "--", group.as_str()])
+        .args(["-KILL", "--", target])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -436,6 +663,14 @@ fn process_group_id(stat: &str) -> Option<u32> {
 fn process_state(stat: &str) -> Option<&str> {
     let (_, after_comm) = stat.rsplit_once(')')?;
     after_comm.split_whitespace().next()
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid(stat: &str) -> Option<u32> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
 }
 
 /// A zombie still occupies its process group until something reaps it. It is
