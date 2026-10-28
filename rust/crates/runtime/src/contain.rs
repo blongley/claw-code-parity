@@ -111,6 +111,10 @@ pub(crate) fn spawn_trusted(
         argument_strings.push(cstring_from_os(arg)?);
     }
     let envp = environment_from(template)?;
+    // Pointer buffers are built before `fork`. `usize` keeps the closure
+    // `Send`, and `pre_exec` only reinterprets the same bits.
+    let argv_ptrs = pointer_words(&argument_strings);
+    let env_ptrs = pointer_words(&envp);
     let raw = fd.as_raw_fd();
     let mut command = Command::new("/bin/sh");
     if let Some(dir) = template.get_current_dir() {
@@ -126,18 +130,25 @@ pub(crate) fn spawn_trusted(
     // across `fork`.
     unsafe {
         command.pre_exec(move || {
-            let argv_ptrs = cstring_ptrs(&argument_strings);
-            let env_ptrs = cstring_ptrs(&envp);
+            // `argument_strings` and `envp` own the bytes the pointer words
+            // address. Referencing them keeps those allocations alive until
+            // `execveat` returns, without allocating on the success path.
+            if argument_strings.len() + 1 != argv_ptrs.len() || envp.len() + 1 != env_ptrs.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "supervisor arguments changed before exec",
+                ));
+            }
             // Safety: `raw` is the trusted descriptor inherited across `fork`.
             // `execveat(AT_EMPTY_PATH)` replaces this process with that inode,
             // so `/bin/sh` never runs. The pointer arrays are NUL-terminated
-            // and live until the call returns. This call sits in the `unsafe`
+            // and were built before `fork`. This call sits in the `unsafe`
             // block that invokes `pre_exec`.
             let err = rustix::runtime::execveat(
                 BorrowedFd::borrow_raw(raw),
                 empty_path(),
-                argv_ptrs.as_ptr(),
-                env_ptrs.as_ptr(),
+                argv_ptrs.as_ptr().cast(),
+                env_ptrs.as_ptr().cast(),
                 AtFlags::EMPTY_PATH,
             );
             Err(io::Error::from(err))
@@ -146,33 +157,55 @@ pub(crate) fn spawn_trusted(
     command.spawn()
 }
 
-/// Run the shell in a new session, and move it into `cgroup_procs` before exec.
+/// Run the shell in a new session, arm parent-death, and move it into
+/// `cgroup_procs` before exec. The path is a `CString` so the child does not
+/// allocate.
 #[allow(unsafe_code)]
-pub(crate) fn isolate_shell(command: &mut Command, cgroup_procs: &Path) {
-    let procs = cgroup_procs.to_path_buf();
+pub(crate) fn isolate_shell(command: &mut Command, cgroup_procs: &CStr) {
+    let procs = cgroup_procs.to_owned();
     // Safety: runs after `fork` and before `exec`. Failure aborts the exec,
     // so the command cannot start outside the cgroup or in our session.
     unsafe {
         command.pre_exec(move || {
             rustix::process::setsid().map_err(io::Error::from)?;
+            arm_parent_death()?;
             write_self_to_cgroup(&procs)?;
             Ok(())
         });
     }
 }
 
-/// New session only. Used for the command inside a pid namespace.
+/// New session and parent-death signal. Used for the command inside a pid
+/// namespace, where killing pid 1 already tears the namespace down.
 #[allow(unsafe_code)]
 pub(crate) fn setsid_child(command: &mut Command) {
     unsafe {
         command.pre_exec(|| {
             rustix::process::setsid().map_err(io::Error::from)?;
+            arm_parent_death()?;
             Ok(())
         });
     }
 }
 
-fn write_self_to_cgroup(procs: &Path) -> io::Result<()> {
+/// `SIGKILL` this process when its parent dies. Used for `unshare`, whose
+/// parent is the supervisor.
+#[allow(unsafe_code)]
+pub(crate) fn parent_death_child(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            arm_parent_death()?;
+            Ok(())
+        });
+    }
+}
+
+fn arm_parent_death() -> io::Result<()> {
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+        .map_err(io::Error::from)
+}
+
+fn write_self_to_cgroup(procs: &CStr) -> io::Result<()> {
     let pid = rustix::process::getpid().as_raw_pid();
     let mut buf = [0_u8; 16];
     let length = format_pid(pid, &mut buf);
@@ -185,7 +218,10 @@ fn write_all(fd: &OwnedFd, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
         let wrote = rustix::io::write(fd, buf).map_err(io::Error::from)?;
         if wrote == 0 {
-            return Err(io::Error::other("cgroup.procs write returned no bytes"));
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "cgroup.procs write returned no bytes",
+            ));
         }
         buf = &buf[wrote..];
     }
@@ -240,13 +276,13 @@ fn environment_from(template: &Command) -> io::Result<Vec<CString>> {
     Ok(encoded)
 }
 
-fn cstring_ptrs(values: &[CString]) -> Vec<*const u8> {
-    let mut ptrs = values
+fn pointer_words(values: &[CString]) -> Vec<usize> {
+    let mut words = values
         .iter()
-        .map(|value| value.as_ptr().cast::<u8>())
+        .map(|value| value.as_ptr() as usize)
         .collect::<Vec<_>>();
-    ptrs.push(std::ptr::null());
-    ptrs
+    words.push(0);
+    words
 }
 
 fn empty_path() -> &'static CStr {
