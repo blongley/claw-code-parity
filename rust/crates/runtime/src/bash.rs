@@ -1,15 +1,17 @@
 #[cfg(all(test, unix))]
 use std::cell::Cell;
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::fd::AsFd;
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -121,7 +123,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let mut prepared = prepare_command(&command, &cwd, &sandbox_status, true);
     if let Some(timeout_ms) = timeout {
         execute_with_timeout(
-            prepared,
+            &prepared,
             timeout_ms,
             dangerously_disable_sandbox,
             sandbox_status,
@@ -137,119 +139,85 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
 }
 
 fn execute_with_timeout(
-    command: Command,
+    command: &Command,
     timeout_ms: u64,
     dangerously_disable_sandbox: Option<bool>,
     sandbox_status: SandboxStatus,
 ) -> io::Result<BashCommandOutput> {
-    // Detached descendants (`setsid`, a new process group) leave the shell's
-    // process group. A subreaper adopts those orphans. A pid namespace is the
-    // fallback. Process-group tracking cannot see them, so that mode refuses
-    // before the command is started.
-    let supervision = supervision_mode();
-    #[cfg(unix)]
-    if supervision == Supervision::ProcessGroup {
+    // Process-group tracking cannot see `setsid` children. Tests force that
+    // mode to prove the command is refused before it starts. Production
+    // always uses the supervisor, which fail-closes when neither a cgroup
+    // nor a pid namespace is available.
+    #[cfg(all(test, unix))]
+    if supervision_override_is_process_group() {
         return Err(containment_unavailable());
     }
-    let mut command = match supervision {
-        Supervision::PidNamespace => command_in_pid_namespace(&command),
-        Supervision::Subreaper => command_in_subreaper(&command, timeout_ms)?,
-        Supervision::ProcessGroup => command,
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        command.process_group(0);
-    }
-    let mut tracked = TrackedChild::spawn(command)?;
-    let timeout = Duration::from_millis(timeout_ms);
-    let started = Instant::now();
-    // The subreaper kills its own descendants and exits at the deadline.
-    // Readers stay open through that teardown so closing a pipe is not what
-    // stops the command. A stuck supervisor is signaled once, after grace.
-    let grace = supervision_grace(supervision);
-    let reader_deadline = started + timeout + grace;
-    let stdout_reader = spawn_reader(tracked.child.stdout.take(), reader_deadline);
-    let stderr_reader = spawn_reader(tracked.child.stderr.take(), reader_deadline);
-    let status = tracked.wait_until(started + timeout, grace)?;
-    let signaled = tracked.signaled;
-    let stdout = join_reader(stdout_reader)?;
-    let stderr = join_reader(stderr_reader)?;
-    if command_timed_out(
-        supervision,
-        status.as_ref(),
-        started.elapsed(),
-        timeout,
-        signaled,
-        stdout.timed_out,
-        stderr.timed_out,
-    ) {
-        return Ok(timed_out_output(
-            &stdout.bytes,
-            &stderr.bytes,
+        execute_contained(
+            command,
             timeout_ms,
             dangerously_disable_sandbox,
             sandbox_status,
-        ));
+        )
     }
-    let status = status.ok_or_else(|| io::Error::other("command ended without a status"))?;
-    Ok(completed_output(
-        &Output {
-            status,
-            stdout: stdout.bytes,
-            stderr: stderr.bytes,
-        },
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            command,
+            timeout_ms,
+            dangerously_disable_sandbox,
+            sandbox_status,
+        );
+        Err(containment_unavailable())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_contained(
+    command: &Command,
+    timeout_ms: u64,
+    dangerously_disable_sandbox: Option<bool>,
+    sandbox_status: SandboxStatus,
+) -> io::Result<BashCommandOutput> {
+    let line = command_line(command);
+    let status_path = create_status_file()?;
+    let _status_cleanup = RemoveFile(status_path.clone());
+    #[cfg(test)]
+    stage_supervisor_for_harness();
+    let supervisor = open_supervisor_fd()?;
+    let args = [
+        OsString::from("bash-supervisor"),
+        status_path.as_os_str().to_os_string(),
+        OsString::from(timeout_ms.to_string()),
+        OsString::from(line),
+    ];
+    // No `process_group(0)`: the supervisor calls `setsid`, which fails when
+    // the child is already a process-group leader.
+    let child = crate::contain::spawn_trusted(&supervisor, &args, command)?;
+    let mut tracked = TrackedChild::from_child(child);
+    let started = Instant::now();
+    // The supervisor waits `timeout + 2s` when a child will not die. Readers
+    // and the backstop sit past that, so a live supervisor is not signaled
+    // during its own teardown.
+    let backstop = started + Duration::from_millis(timeout_ms) + Duration::from_secs(3);
+    let stdout_reader = spawn_reader(tracked.child.stdout.take(), backstop);
+    let stderr_reader = spawn_reader(tracked.child.stderr.take(), backstop);
+    let verdict = watch_supervisor(&mut tracked, &status_path, backstop)?;
+    let stdout = join_reader(stdout_reader)?;
+    let stderr = join_reader(stderr_reader)?;
+    finish_contained(
+        verdict,
+        &stdout.bytes,
+        &stderr.bytes,
+        timeout_ms,
         dangerously_disable_sandbox,
         sandbox_status,
-    ))
-}
-
-/// The supervisor process exits with this status after it has killed every
-/// adopted child. A command that exits 124 well before the deadline keeps
-/// that status; a 124 that arrives at the deadline is a timeout.
-const SUPERVISOR_TIMEOUT_EXIT: i32 = 124;
-
-fn supervision_grace(mode: Supervision) -> Duration {
-    match mode {
-        // Teardown runs inside the supervisor. This grace is only the
-        // backstop for a supervisor that never exits.
-        Supervision::Subreaper => Duration::from_secs(1),
-        Supervision::PidNamespace | Supervision::ProcessGroup => Duration::ZERO,
-    }
-}
-
-fn command_timed_out(
-    supervision: Supervision,
-    status: Option<&ExitStatus>,
-    elapsed: Duration,
-    timeout: Duration,
-    signaled: bool,
-    stdout_timed_out: bool,
-    stderr_timed_out: bool,
-) -> bool {
-    let Some(status) = status else {
-        return true;
-    };
-    if signaled {
-        return true;
-    }
-    match supervision {
-        Supervision::Subreaper => {
-            status.code() == Some(SUPERVISOR_TIMEOUT_EXIT)
-                && elapsed + Duration::from_millis(50) >= timeout
-        }
-        Supervision::PidNamespace | Supervision::ProcessGroup => {
-            stdout_timed_out || stderr_timed_out
-        }
-    }
+    )
 }
 
 struct PipeRead {
     bytes: Vec<u8>,
-    timed_out: bool,
 }
 
 #[cfg(unix)]
@@ -259,10 +227,7 @@ fn spawn_reader(
 ) -> JoinHandle<io::Result<PipeRead>> {
     thread::spawn(move || match pipe {
         Some(pipe) => read_pipe_until(pipe, deadline),
-        None => Ok(PipeRead {
-            bytes: Vec::new(),
-            timed_out: false,
-        }),
+        None => Ok(PipeRead { bytes: Vec::new() }),
     })
 }
 
@@ -276,15 +241,9 @@ fn spawn_reader(
         Some(mut pipe) => {
             let mut bytes = Vec::new();
             pipe.read_to_end(&mut bytes)?;
-            Ok(PipeRead {
-                bytes,
-                timed_out: false,
-            })
+            Ok(PipeRead { bytes })
         }
-        None => Ok(PipeRead {
-            bytes: Vec::new(),
-            timed_out: false,
-        }),
+        None => Ok(PipeRead { bytes: Vec::new() }),
     })
 }
 
@@ -296,26 +255,17 @@ fn read_pipe_until(mut pipe: impl Read + AsFd, deadline: Instant) -> io::Result<
     let mut buf = [0_u8; 8_192];
     loop {
         if Instant::now() >= deadline {
-            return Ok(PipeRead {
-                bytes,
-                timed_out: true,
-            });
+            return Ok(PipeRead { bytes });
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let Ok(timeout) = Timespec::try_from(remaining) else {
-            return Ok(PipeRead {
-                bytes,
-                timed_out: true,
-            });
+            return Ok(PipeRead { bytes });
         };
         let events = {
             let mut fds = [PollFd::new(&pipe, PollFlags::IN)];
             match rustix::event::poll(&mut fds, Some(&timeout)) {
                 Ok(0) => {
-                    return Ok(PipeRead {
-                        bytes,
-                        timed_out: true,
-                    });
+                    return Ok(PipeRead { bytes });
                 }
                 Ok(_) => fds[0].revents(),
                 Err(rustix::io::Errno::INTR) => continue,
@@ -330,10 +280,7 @@ fn read_pipe_until(mut pipe: impl Read + AsFd, deadline: Instant) -> io::Result<
         }
         match pipe.read(&mut buf) {
             Ok(0) => {
-                return Ok(PipeRead {
-                    bytes,
-                    timed_out: false,
-                });
+                return Ok(PipeRead { bytes });
             }
             Ok(count) => bytes.extend_from_slice(&buf[..count]),
             Err(err)
@@ -355,50 +302,25 @@ fn join_reader(handle: JoinHandle<io::Result<PipeRead>>) -> io::Result<PipeRead>
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(test, not(target_os = "linux")))]
 fn containment_unavailable() -> io::Error {
-    io::Error::other(
-        "cannot contain detached child processes (no subreaper or pid namespace); refusing to report the command as finished",
-    )
+    unavailable_error("")
 }
 
-/// Supervisor script run as pid 1 inside `unshare --pid`. It records the
-/// shell status, reaps every descendant (including `setsid` orphans and
-/// zombies), and exits only when nothing else in the namespace is alive.
-const PID_NAMESPACE_SUPERVISOR: &str = r#"
-target=$1
-sh -c "$target" &
-child=$!
-status=0
-wait "$child" || status=$?
-alive() {
-  for entry in /proc/[0-9]*; do
-    pid=${entry##*/}
-    if [ "$pid" = "1" ]; then
-      continue
-    fi
-    stat=$(cat "$entry/stat" 2>/dev/null) || continue
-    rest=${stat#*)}
-    rest=${rest# }
-    state=${rest%% *}
-    if [ "$state" != "Z" ]; then
-      return 0
-    fi
-  done
-  return 1
+fn unavailable_error(detail: &str) -> io::Error {
+    let detail = if detail.is_empty() {
+        "no cgroup or pid namespace"
+    } else {
+        detail
+    };
+    io::Error::other(format!(
+        "cannot contain detached child processes ({detail}); refusing to start the command"
+    ))
 }
-while alive; do
-  wait || true
-  sleep 0.05
-done
-wait || true
-exit "$status"
-"#;
 
+#[cfg(all(test, unix))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Supervision {
-    PidNamespace,
-    Subreaper,
     ProcessGroup,
 }
 
@@ -424,211 +346,248 @@ impl Drop for SupervisionOverride {
     }
 }
 
-fn supervision_mode() -> Supervision {
-    #[cfg(all(test, unix))]
-    if let Some(mode) = SUPERVISION_OVERRIDE.with(Cell::get) {
-        return mode;
+#[cfg(all(test, unix))]
+fn supervision_override_is_process_group() -> bool {
+    SUPERVISION_OVERRIDE.with(Cell::get) == Some(Supervision::ProcessGroup)
+}
+
+#[cfg(target_os = "linux")]
+fn create_status_file() -> io::Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let path = env::temp_dir().join(format!("claw-bash-{}-{nanos}.status", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    options.mode(0o600);
+    options.open(&path)?;
+    Ok(path)
+}
+
+struct RemoveFile(PathBuf);
+
+impl Drop for RemoveFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
-    // A child subreaper does not need a user namespace. Hosts that block
-    // unprivileged `unshare --user` still adopt `setsid` orphans this way.
-    // The pid namespace is the fallback when that subreaper cannot be started.
-    // Process-group tracking cannot see detached children, so that mode
-    // refuses to start the command.
-    if subreaper_supervisor_available() {
-        Supervision::Subreaper
-    } else if pid_namespace_supervisor_available() {
-        Supervision::PidNamespace
-    } else {
-        Supervision::ProcessGroup
+}
+
+#[cfg(target_os = "linux")]
+fn open_supervisor_fd() -> io::Result<rustix::fd::OwnedFd> {
+    if let Some(path) = explicit_supervisor_path() {
+        return crate::contain::open_trusted_supervisor(Path::new(&path));
     }
+    let executable = env::current_exe()?;
+    let beside = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("current executable has no directory"))?
+        .join("bash-supervisor");
+    crate::contain::open_trusted_supervisor(&beside)
 }
 
-fn pid_namespace_supervisor_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        Command::new("unshare")
-            .args([
-                "--user",
-                "--map-root-user",
-                "--pid",
-                "--fork",
-                "--mount-proc",
-                "--kill-child",
-                "--",
-                "sh",
-                "-c",
-                "printf ok",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .is_ok_and(|output| output.status.success() && output.stdout == b"ok")
-    })
-}
-
-fn subreaper_supervisor_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let Some(program) = supervisor_program() else {
-            return false;
-        };
-        // Probe outside the workspace. The supervisor is a Rust binary, so a
-        // local `ctypes.py` or a PATH-shadowed `python3` cannot run here.
-        Command::new(program)
-            .arg("1000")
-            .arg("exit 0")
-            .current_dir(env::temp_dir())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    })
-}
-
-/// Absolute path to the Rust subreaper. Never resolved through `PATH`.
-///
-/// An explicit absolute path is accepted only when it passes
-/// [`trusted_supervisor`]. Otherwise the only candidate is `bash-supervisor`
-/// in the same directory as the current executable. Nothing above that
-/// directory is searched, and symlinks are not followed.
-fn supervisor_program() -> Option<PathBuf> {
+fn explicit_supervisor_path() -> Option<OsString> {
     for key in ["CLAWD_BASH_SUPERVISOR", "CARGO_BIN_EXE_bash-supervisor"] {
         if let Some(value) = env::var_os(key) {
-            if let Some(found) = accepted_supervisor(Path::new(&value)) {
-                return Some(found);
+            if !value.is_empty() {
+                return Some(value);
             }
         }
     }
-    // Unit-test harnesses live under `target/debug/deps` and do not receive
-    // `CARGO_BIN_EXE_bash-supervisor`. Place the already-built binary beside
-    // the harness so the production check above can see it. This is not a
-    // lookup used to execute a parent path.
-    #[cfg(test)]
-    stage_supervisor_for_harness();
-    let exe = env::current_exe().ok()?;
-    supervisor_next_to(&exe)
+    None
 }
 
+#[cfg(all(test, target_os = "linux"))]
+fn stage_supervisor_for_harness() {
+    let Ok(executable) = env::current_exe() else {
+        return;
+    };
+    let Some(dir) = executable.parent() else {
+        return;
+    };
+    let Some(source_dir) = dir.parent() else {
+        return;
+    };
+    let source = source_dir.join("bash-supervisor");
+    if !source.is_file() {
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = dir.join(format!(
+        ".bash-supervisor-{}-{nanos}.tmp",
+        std::process::id()
+    ));
+    if std::fs::copy(&source, &temporary).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return;
+    }
+    if std::fs::rename(&temporary, dir.join("bash-supervisor")).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 fn accepted_supervisor(path: &Path) -> Option<PathBuf> {
-    (path.is_absolute() && trusted_supervisor(path)).then(|| path.to_path_buf())
+    if !path.is_absolute() {
+        return None;
+    }
+    crate::contain::open_trusted_supervisor(path)
+        .ok()
+        .map(|_| path.to_path_buf())
 }
 
-fn supervisor_next_to(exe: &Path) -> Option<PathBuf> {
-    let beside = exe.parent()?.join("bash-supervisor");
+#[cfg(all(test, target_os = "linux"))]
+fn supervisor_next_to(executable: &Path) -> Option<PathBuf> {
+    let beside = executable.parent()?.join("bash-supervisor");
     accepted_supervisor(&beside)
 }
 
-fn trusted_supervisor(path: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    // `symlink_metadata` does not follow links. A symlink is not a regular file.
-    if !meta.file_type().is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o002 != 0 {
-            return false;
-        }
-        if !supervisor_owner_is_trusted(file_owner(&meta)) {
-            return false;
-        }
-    }
-    true
+#[cfg(target_os = "linux")]
+enum Verdict {
+    Reported(crate::supervisor::SupervisorOutcome),
+    BackstopTimeout,
+    BackstopUnkillable,
 }
 
-#[cfg(unix)]
-fn file_owner(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.uid()
-}
-
-#[cfg(unix)]
-fn supervisor_owner_is_trusted(owner: u32) -> bool {
-    let current = rustix::process::getuid().as_raw();
-    owner == current || owner == 0
-}
-
-#[cfg(test)]
-fn stage_supervisor_for_harness() {
-    let Ok(exe) = env::current_exe() else {
-        return;
-    };
-    let Some(dir) = exe.parent() else {
-        return;
-    };
-    let dest = dir.join("bash-supervisor");
-    if accepted_supervisor(&dest).is_some() {
-        return;
-    }
-    let Some(src_dir) = dir.parent() else {
-        return;
-    };
-    let src = src_dir.join("bash-supervisor");
-    if accepted_supervisor(&src).is_none() {
-        return;
-    }
-    if std::fs::hard_link(&src, &dest).is_err() {
-        let _ = accepted_supervisor(&dest);
-    }
-}
-
-fn command_in_pid_namespace(command: &Command) -> Command {
-    let line = command_line(command);
-    let mut supervised = command_with_context("unshare", command);
-    supervised.args([
-        "--user",
-        "--map-root-user",
-        "--pid",
-        "--fork",
-        "--mount-proc",
-        "--kill-child",
-        "--",
-        "sh",
-        "-c",
-        PID_NAMESPACE_SUPERVISOR,
-        "sh",
-        &line,
-    ]);
-    supervised
-}
-
-fn command_in_subreaper(command: &Command, timeout_ms: u64) -> io::Result<Command> {
-    let program = supervisor_program().ok_or_else(|| {
-        io::Error::other("bash supervisor is unavailable; cannot contain detached child processes")
-    })?;
-    let line = command_line(command);
-    let mut supervised = command_with_context(&program, command);
-    supervised.arg(timeout_ms.to_string());
-    supervised.arg(line);
-    Ok(supervised)
-}
-
-fn command_with_context(program: impl AsRef<OsStr>, source: &Command) -> Command {
-    let current_dir = source.get_current_dir().map(PathBuf::from);
-    let envs = source
-        .get_envs()
-        .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
-        .collect::<Vec<_>>();
-    let mut command = Command::new(program);
-    if let Some(dir) = current_dir {
-        command.current_dir(dir);
-    }
-    for (key, value) in envs {
-        match value {
-            Some(value) => {
-                command.env(key, value);
+#[cfg(target_os = "linux")]
+fn watch_supervisor(
+    tracked: &mut TrackedChild,
+    status_path: &Path,
+    backstop: Instant,
+) -> io::Result<Verdict> {
+    let mut containment = None;
+    let mut unshare_pidfd = None;
+    loop {
+        let text = std::fs::read_to_string(status_path).unwrap_or_default();
+        if let Some(live) = crate::supervisor::parse_live_containment(&text) {
+            if unshare_pidfd.is_none() {
+                if let crate::supervisor::LiveContainment::PidNamespace(pid) = &live {
+                    unshare_pidfd = open_pidfd(*pid);
+                }
             }
-            None => {
-                command.env_remove(key);
+            containment = Some(live);
+        }
+        if tracked.child.try_wait()?.is_some() {
+            tracked.reaped = true;
+            break;
+        }
+        if Instant::now() >= backstop {
+            return Ok(intervene(
+                tracked,
+                containment.as_ref(),
+                unshare_pidfd.as_ref(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let text = std::fs::read_to_string(status_path).unwrap_or_default();
+    crate::supervisor::parse_supervisor_result(&text).map_or_else(
+        || {
+            Err(io::Error::other(format!(
+                "supervisor ended without a containment status ({text})"
+            )))
+        },
+        |outcome| Ok(Verdict::Reported(outcome)),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn intervene(
+    tracked: &mut TrackedChild,
+    containment: Option<&crate::supervisor::LiveContainment>,
+    unshare_pidfd: Option<&std::os::fd::OwnedFd>,
+) -> Verdict {
+    match containment {
+        Some(crate::supervisor::LiveContainment::Cgroup(dir))
+            if crate::supervisor::cgroup_dir_is_ours(dir) =>
+        {
+            crate::supervisor::kill_cgroup(dir);
+            if crate::supervisor::wait_cgroup_empty(dir, Duration::from_secs(2)) {
+                tracked.signal_once();
+                tracked.reap_for(Duration::from_millis(200));
+                Verdict::BackstopTimeout
+            } else {
+                Verdict::BackstopUnkillable
             }
         }
+        Some(crate::supervisor::LiveContainment::PidNamespace(_)) => {
+            let signaled = unshare_pidfd.is_some_and(|pidfd| {
+                rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL).is_ok()
+            });
+            if signaled
+                && unshare_pidfd.is_some_and(|pidfd| pidfd_exited(pidfd, Duration::from_secs(2)))
+            {
+                tracked.signal_once();
+                tracked.reap_for(Duration::from_millis(200));
+                Verdict::BackstopTimeout
+            } else {
+                Verdict::BackstopUnkillable
+            }
+        }
+        _ => Verdict::BackstopUnkillable,
     }
-    command
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_exited(pidfd: &std::os::fd::OwnedFd, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = Timespec::try_from(remaining).ok();
+        let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, timeout.as_ref()) {
+            Ok(0) => return false,
+            Ok(_) => return true,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish_contained(
+    verdict: Verdict,
+    stdout: &[u8],
+    stderr: &[u8],
+    timeout_ms: u64,
+    dangerously_disable_sandbox: Option<bool>,
+    sandbox_status: SandboxStatus,
+) -> io::Result<BashCommandOutput> {
+    match verdict {
+        Verdict::BackstopTimeout
+        | Verdict::Reported(crate::supervisor::SupervisorOutcome::Timeout) => Ok(timed_out_output(
+            stdout,
+            stderr,
+            timeout_ms,
+            dangerously_disable_sandbox,
+            sandbox_status,
+        )),
+        Verdict::BackstopUnkillable
+        | Verdict::Reported(crate::supervisor::SupervisorOutcome::Unkillable) => Ok(
+            unkillable_output(stdout, stderr, dangerously_disable_sandbox, sandbox_status),
+        ),
+        Verdict::Reported(crate::supervisor::SupervisorOutcome::Finished(code)) => {
+            Ok(completed_output(
+                &Output {
+                    status: ExitStatus::from_raw(code << 8),
+                    stdout: stdout.to_vec(),
+                    stderr: stderr.to_vec(),
+                },
+                dangerously_disable_sandbox,
+                sandbox_status,
+            ))
+        }
+        Verdict::Reported(crate::supervisor::SupervisorOutcome::Unavailable { detail }) => {
+            Err(unavailable_error(&detail))
+        }
+        Verdict::Reported(crate::supervisor::SupervisorOutcome::Failed(message)) => {
+            Err(io::Error::other(message))
+        }
+    }
 }
 
 fn command_line(command: &Command) -> String {
@@ -646,10 +605,8 @@ fn shell_quote(arg: &str) -> String {
 
 /// One child, signaled at most once, and never after it has been reaped.
 ///
-/// On Linux the signal goes through a pidfd opened at spawn, so a recycled
-/// pid cannot receive it. The subreaper tears itself down; this signal is
-/// only the backstop after [`supervision_grace`], or the pid-namespace kill
-/// of `unshare --kill-child`.
+/// The signal is the backstop after the cgroup or pid namespace is empty.
+/// Killing the supervisor earlier would let descendants escape.
 struct TrackedChild {
     child: Child,
     #[cfg(target_os = "linux")]
@@ -659,46 +616,26 @@ struct TrackedChild {
 }
 
 impl TrackedChild {
-    fn spawn(mut command: Command) -> io::Result<Self> {
-        let child = command.spawn()?;
-        #[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")]
+    fn from_child(child: Child) -> Self {
         let pidfd = open_pidfd(child.id());
-        Ok(Self {
+        Self {
             child,
-            #[cfg(target_os = "linux")]
             pidfd,
             reaped: false,
             signaled: false,
-        })
+        }
     }
 
-    fn wait_until(
-        &mut self,
-        command_deadline: Instant,
-        grace: Duration,
-    ) -> io::Result<Option<ExitStatus>> {
-        let kill_at = command_deadline
-            .checked_add(grace)
-            .unwrap_or(command_deadline);
-        loop {
-            if let Some(status) = self.child.try_wait()? {
+    #[cfg(target_os = "linux")]
+    fn reap_for(&mut self, bound: Duration) {
+        let deadline = Instant::now() + bound;
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
                 self.reaped = true;
-                return Ok(Some(status));
+                return;
             }
-            let now = Instant::now();
-            if now >= kill_at {
-                self.signal_once();
-                let reap_until = now + Duration::from_millis(200);
-                while Instant::now() < reap_until {
-                    if let Some(status) = self.child.try_wait()? {
-                        self.reaped = true;
-                        return Ok(Some(status));
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                return Ok(None);
-            }
-            thread::sleep(Duration::from_millis(10).min(kill_at.saturating_duration_since(now)));
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -805,6 +742,40 @@ fn completed_output(
         dangerously_disable_sandbox,
         return_code_interpretation,
         no_output_expected,
+        structured_content: None,
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: Some(sandbox_status),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unkillable_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    dangerously_disable_sandbox: Option<bool>,
+    sandbox_status: SandboxStatus,
+) -> BashCommandOutput {
+    let stdout = String::from_utf8_lossy(stdout).into_owned();
+    let captured_stderr = String::from_utf8_lossy(stderr);
+    let status = crate::supervisor::UNKILLABLE_STATUS;
+    let stderr = if captured_stderr.trim().is_empty() {
+        status.to_string()
+    } else {
+        format!("{}\n{status}", captured_stderr.trim_end())
+    };
+    BashCommandOutput {
+        stdout,
+        stderr,
+        raw_output_path: None,
+        interrupted: true,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox,
+        return_code_interpretation: Some(status.to_string()),
+        no_output_expected: Some(true),
         structured_content: None,
         persisted_output_path: None,
         persisted_output_size: None,
@@ -1287,22 +1258,43 @@ os._exit(0)
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn subreaper_program_is_the_rust_supervisor() {
-        let program = super::supervisor_program()
-            .expect("bash-supervisor should be built next to the test binary");
+    fn staged_supervisor_is_a_copy_of_the_current_binary() {
+        use std::os::unix::fs::MetadataExt;
+        super::stage_supervisor_for_harness();
+        let executable = std::env::current_exe().expect("test executable");
+        let program = super::supervisor_next_to(&executable)
+            .expect("bash-supervisor should be copied next to the test binary");
         assert_eq!(
             program.file_name().and_then(|name| name.to_str()),
             Some("bash-supervisor")
+        );
+        let source = executable
+            .parent()
+            .and_then(|dir| dir.parent())
+            .expect("target directory")
+            .join("bash-supervisor");
+        let staged = std::fs::metadata(&program).expect("staged metadata");
+        let built = std::fs::metadata(&source).expect("built metadata");
+        assert_eq!(
+            std::fs::read(&program).expect("staged bytes"),
+            std::fs::read(&source).expect("built bytes")
+        );
+        assert_ne!(
+            staged.ino(),
+            built.ino(),
+            "the test helper must be copied, not hard-linked to a stale inode"
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn supervisor_rejects_symlinks_world_writable_files_and_parent_directories() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+    fn supervisor_rejects_symlinks_group_writes_and_untrusted_parents() {
+        use std::os::unix::fs::symlink;
         let root = std::env::temp_dir().join(unique_token("trust"));
         let deps = root.join("deps");
         std::fs::create_dir_all(&deps).expect("trust dir");
+        set_mode(&root, 0o755);
+        set_mode(&deps, 0o755);
         let above = root.join("bash-supervisor");
         write_executable(&above, "#!/bin/sh\nexit 0\n");
         let exe = deps.join("runtime-test");
@@ -1315,10 +1307,10 @@ os._exit(0)
         assert!(super::accepted_supervisor(std::path::Path::new("bash-supervisor")).is_none());
 
         let beside = deps.join("bash-supervisor");
-        std::fs::hard_link(&above, &beside).expect("hardlink beside the exe");
+        std::fs::copy(&above, &beside).expect("copy beside the exe");
         assert!(super::supervisor_next_to(&exe).is_some());
 
-        std::fs::remove_file(&beside).expect("remove hardlink");
+        std::fs::remove_file(&beside).expect("remove copy");
         symlink(&above, &beside).expect("symlink supervisor");
         assert!(
             super::supervisor_next_to(&exe).is_none(),
@@ -1328,24 +1320,114 @@ os._exit(0)
 
         std::fs::remove_file(&beside).expect("remove symlink");
         write_executable(&beside, "#!/bin/sh\nexit 0\n");
-        let mut permissions = std::fs::symlink_metadata(&beside)
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o666);
-        std::fs::set_permissions(&beside, permissions).expect("mode");
+        set_mode(&beside, 0o666);
         assert!(
-            super::supervisor_next_to(&exe).is_none(),
+            crate::contain::open_trusted_supervisor(&beside).is_err(),
             "a world-writable supervisor must not be accepted"
+        );
+        set_mode(&beside, 0o664);
+        assert!(
+            crate::contain::open_trusted_supervisor(&beside).is_err(),
+            "a group-writable supervisor must not be accepted"
+        );
+
+        let writable_parent = root.join("writable");
+        std::fs::create_dir(&writable_parent).expect("writable parent");
+        set_mode(&writable_parent, 0o755);
+        let nested = writable_parent.join("bash-supervisor");
+        write_executable(&nested, "#!/bin/sh\nexit 0\n");
+        set_mode(&writable_parent, 0o777);
+        assert!(
+            crate::contain::open_trusted_supervisor(&nested).is_err(),
+            "a group-or-other-writable parent directory must not be accepted"
+        );
+
+        let real = root.join("real");
+        std::fs::create_dir(&real).expect("real parent");
+        set_mode(&real, 0o755);
+        let real_file = real.join("bash-supervisor");
+        write_executable(&real_file, "#!/bin/sh\nexit 0\n");
+        let linked_parent = root.join("linked-parent");
+        symlink(&real, &linked_parent).expect("symlinked parent");
+        let through_link = linked_parent.join("bash-supervisor");
+        assert!(
+            crate::contain::open_trusted_supervisor(&through_link).is_err(),
+            "a symlinked parent directory must not be accepted"
         );
 
         let current = rustix::process::getuid().as_raw();
-        assert!(super::supervisor_owner_is_trusted(current));
-        assert!(super::supervisor_owner_is_trusted(0));
+        assert!(crate::contain::owner_is_trusted(current));
+        assert!(crate::contain::owner_is_trusted(0));
         let other = current.wrapping_add(1);
         if other != 0 {
-            assert!(!super::supervisor_owner_is_trusted(other));
+            assert!(!crate::contain::owner_is_trusted(other));
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_exit_124_is_not_a_timeout() {
+        let output = execute_bash(unsandboxed("exit 124", Some(1_000), false))
+            .expect("exit 124 should return");
+        assert!(!output.interrupted);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("exit_code:124")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unkillable_status_is_not_exit_127() {
+        let output =
+            super::unkillable_output(&[], &[], None, crate::sandbox::SandboxStatus::default());
+        assert!(output.interrupted);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("processes could not be killed")
+        );
+        assert!(output.stderr.contains("processes could not be killed"));
+        assert_ne!(
+            output.return_code_interpretation.as_deref(),
+            Some("exit_code:127")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_stop_of_the_command_group_does_not_freeze_the_supervisor() {
+        let _guard = crate::test_env_lock();
+        let started = std::time::Instant::now();
+        let output = execute_bash(unsandboxed(
+            "kill -STOP 0; echo continued",
+            Some(400),
+            false,
+        ))
+        .expect("stopped command should still hit the timeout");
+        let elapsed = started.elapsed();
+
+        assert!(
+            output.interrupted,
+            "supervisor did not time out: {}",
+            output.stderr
+        );
+        assert!(
+            !output.stdout.contains("continued"),
+            "the shell kept running after kill -STOP 0"
+        );
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "timeout returned after {elapsed:?}, before the deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout returned after {elapsed:?}; kill -STOP 0 reached the supervisor"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1587,6 +1669,16 @@ while True:
         );
         let done = std::path::Path::new(&marker).with_file_name("done");
         std::fs::write(done, "ok").expect("done marker");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::symlink_metadata(path)
+            .expect("mode metadata")
+            .permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(path, permissions).expect("set mode");
     }
 
     #[cfg(target_os = "linux")]

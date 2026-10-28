@@ -4919,16 +4919,26 @@ mod tests {
         let Some(dir) = exe.parent() else {
             return;
         };
-        let dest = dir.join("bash-supervisor");
-        if fs::symlink_metadata(&dest).is_ok_and(|meta| meta.file_type().is_file()) {
-            return;
-        }
         let Some(src_dir) = dir.parent() else {
             return;
         };
         let src = src_dir.join("bash-supervisor");
-        if src.is_file() {
-            let _ = fs::hard_link(&src, &dest);
+        if !src.is_file() {
+            return;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let temporary = dir.join(format!(
+            ".bash-supervisor-{}-{nanos}.tmp",
+            std::process::id()
+        ));
+        if fs::copy(&src, &temporary).is_err() {
+            let _ = fs::remove_file(&temporary);
+            return;
+        }
+        if fs::rename(&temporary, dir.join("bash-supervisor")).is_err() {
+            let _ = fs::remove_file(&temporary);
         }
     }
 

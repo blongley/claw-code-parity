@@ -10,12 +10,22 @@ sha2 = "0.10"
 glob = "0.3"
 plugins = { path = "../plugins" }
 regex = "1"
-rustix = { version = "1.1.4", features = ["std", "process", "event"] }
+rustix = { version = "1.1.4", features = ["std", "process", "event", "fs", "runtime"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 walkdir = "2"
 
-[lints]
-workspace = true
+# `unsafe_code` is `deny` rather than the workspace `forbid` so containment can
+# call `execveat` and `pre_exec`. Those calls stay in `contain.rs`. Clippy
+# lints match the workspace.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
