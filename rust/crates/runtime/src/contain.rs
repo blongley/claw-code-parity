@@ -10,13 +10,15 @@
 #![allow(unsafe_code)]
 
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
+#[cfg(test)]
+use std::sync::{Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -28,10 +30,16 @@ use rustix::process::{Signal, WaitId, WaitIdOptions, WaitIdStatus, WaitOptions, 
 pub(crate) const UNKILLABLE_STATUS: &str = "processes could not be killed";
 
 const RELEASED: u8 = 1;
-const ARM_FAILED: i32 = 86;
+/// Exit codes from init before the ack byte. The parent maps each one to the
+/// step that failed. They are not shell statuses.
+const EXIT_INSTALL_FDS: i32 = 80;
+const EXIT_CLOSE_FDS: i32 = 81;
+const EXIT_PDEATHSIG: i32 = 82;
+const EXIT_PARENT: i32 = 83;
+const EXIT_ACK: i32 = 84;
 const EMPTY_WAIT: Duration = Duration::from_secs(2);
-/// Allowlisted child descriptors. `close_range(3, ~0, 0)` drops every other fd
-/// the child inherited, including another init's stdout writer.
+/// Allowlisted child descriptors. Everything from 3 up is inherited and must
+/// be closed, including another init's stdout writer.
 const FD_CONTROL: i32 = 0;
 const FD_STDOUT: i32 = 1;
 const FD_STDERR: i32 = 2;
@@ -54,7 +62,11 @@ pub(crate) struct Captured {
 thread_local! {
     static FAIL_NAMESPACE: Cell<bool> = const { Cell::new(false) };
     static FAIL_ARMING: Cell<bool> = const { Cell::new(false) };
+    static FAIL_CLOSE: Cell<bool> = const { Cell::new(false) };
+    static FORCE_FD_WALK: Cell<bool> = const { Cell::new(false) };
     static RELEASES: Cell<u32> = const { Cell::new(0) };
+    static RELEASE_DELAY_MS: Cell<u64> = const { Cell::new(0) };
+    static OVERLAP: RefCell<Option<Arc<Barrier>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -68,6 +80,8 @@ pub(crate) struct FailureGuard {
 enum FailureKind {
     Namespace,
     Arming,
+    Close,
+    FdWalk,
 }
 
 #[cfg(test)]
@@ -87,11 +101,70 @@ pub(crate) fn inject_arming_failure() -> FailureGuard {
 }
 
 #[cfg(test)]
+pub(crate) fn inject_close_failure() -> FailureGuard {
+    FAIL_CLOSE.with(|cell| cell.set(true));
+    FailureGuard {
+        kind: FailureKind::Close,
+    }
+}
+
+/// Skip `close_range` and close descriptors one by one. The child still must
+/// not allocate.
+#[cfg(test)]
+pub(crate) fn inject_fd_walk() -> FailureGuard {
+    FORCE_FD_WALK.with(|cell| cell.set(true));
+    FailureGuard {
+        kind: FailureKind::FdWalk,
+    }
+}
+
+#[cfg(test)]
+#[must_use = "the release delay ends when this guard is dropped"]
+pub(crate) struct ReleaseDelayGuard;
+
+/// Sleep in the parent after id maps and before the release byte, so a short
+/// deadline can pass after init is armed.
+#[cfg(test)]
+pub(crate) fn delay_release_by(delay: Duration) -> ReleaseDelayGuard {
+    let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    RELEASE_DELAY_MS.with(|cell| cell.set(millis));
+    ReleaseDelayGuard
+}
+
+#[cfg(test)]
+impl Drop for ReleaseDelayGuard {
+    fn drop(&mut self) {
+        RELEASE_DELAY_MS.with(|cell| cell.set(0));
+    }
+}
+
+#[cfg(test)]
+#[must_use = "the overlap barrier ends when this guard is dropped"]
+pub(crate) struct OverlapGuard;
+
+/// Both launches wait after their pipes exist and before `clone3`, so each
+/// init inherits the other's write ends.
+#[cfg(test)]
+pub(crate) fn overlap_at_clone(barrier: Arc<Barrier>) -> OverlapGuard {
+    OVERLAP.with(|slot| *slot.borrow_mut() = Some(barrier));
+    OverlapGuard
+}
+
+#[cfg(test)]
+impl Drop for OverlapGuard {
+    fn drop(&mut self) {
+        OVERLAP.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
 impl Drop for FailureGuard {
     fn drop(&mut self) {
         match self.kind {
             FailureKind::Namespace => FAIL_NAMESPACE.with(|cell| cell.set(false)),
             FailureKind::Arming => FAIL_ARMING.with(|cell| cell.set(false)),
+            FailureKind::Close => FAIL_CLOSE.with(|cell| cell.set(false)),
+            FailureKind::FdWalk => FORCE_FD_WALK.with(|cell| cell.set(false)),
         }
     }
 }
@@ -127,6 +200,8 @@ pub(crate) fn run_timed(
         stderr_write.as_raw_fd(),
         child_control.as_raw_fd(),
     )?;
+    #[cfg(test)]
+    wait_for_overlap();
 
     let mut pidfd_slot = -1;
     let pid = match clone3(
@@ -229,9 +304,7 @@ fn supervise(
                 Ok(code) => {
                     init.reaped = true;
                     Containment::Unavailable {
-                        detail: format!(
-                            "pid namespace init did not arm parent-death signal (exit {code})"
-                        ),
+                        detail: setup_failure_detail(code),
                     }
                 }
                 Err(detail) => {
@@ -255,6 +328,8 @@ fn supervise(
     }
     // Maps can outrun a short timeout. Do not release a command whose deadline
     // has already passed.
+    #[cfg(test)]
+    pause_before_release();
     if Instant::now() >= deadline {
         return finish_deadline(init);
     }
@@ -623,6 +698,7 @@ struct ExecImage {
     control: i32,
     original_parent: i32,
     fail_arming: bool,
+    close_fds: CloseFds,
 }
 
 impl ExecImage {
@@ -657,6 +733,7 @@ impl ExecImage {
             control,
             original_parent: rustix::process::getpid().as_raw_pid(),
             fail_arming: arming_failure_injected(),
+            close_fds: configured_close_fds(),
         })
     }
 }
@@ -669,6 +746,47 @@ fn arming_failure_injected() -> bool {
     #[cfg(not(test))]
     {
         false
+    }
+}
+
+fn configured_close_fds() -> CloseFds {
+    #[cfg(test)]
+    {
+        if FAIL_CLOSE.with(Cell::get) {
+            return CloseFds::Fail;
+        }
+        if FORCE_FD_WALK.with(Cell::get) {
+            return CloseFds::Walk;
+        }
+    }
+    CloseFds::Range
+}
+
+fn setup_failure_detail(code: i32) -> String {
+    let step = match code {
+        EXIT_INSTALL_FDS => "install allowlisted descriptors",
+        EXIT_CLOSE_FDS => "close inherited descriptors",
+        EXIT_PDEATHSIG => "arm parent-death signal",
+        EXIT_PARENT => "confirm the original parent",
+        EXIT_ACK => "write the readiness ack",
+        _ => "complete containment setup",
+    };
+    format!("pid namespace init failed to {step} (exit {code})")
+}
+
+#[cfg(test)]
+fn wait_for_overlap() {
+    let barrier = OVERLAP.with(|slot| slot.borrow().clone());
+    if let Some(barrier) = barrier {
+        barrier.wait();
+    }
+}
+
+#[cfg(test)]
+fn pause_before_release() {
+    let delay = RELEASE_DELAY_MS.with(Cell::get);
+    if delay > 0 {
+        thread::sleep(Duration::from_millis(delay));
     }
 }
 
@@ -786,26 +904,31 @@ fn clone3_raw(flags: u64, pidfd: Option<&mut i32>, set_tid: Option<&mut i32>) ->
 }
 
 fn enter_init(image: &ExecImage) -> ! {
-    retain_allowlisted_fds(image.control, image.stdout_write, image.stderr_write);
+    retain_allowlisted_fds(
+        image.control,
+        image.stdout_write,
+        image.stderr_write,
+        image.close_fds,
+    );
     if image.fail_arming {
-        raw_exit(ARM_FAILED);
+        raw_exit(EXIT_PDEATHSIG);
     }
     // Safety: `PR_SET_PDEATHSIG` takes the signal in the second argument.
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-        raw_exit(ARM_FAILED);
+        raw_exit(EXIT_PDEATHSIG);
     }
     // Inside the new pid namespace the creator is reported as 0. Any other
     // unexpected parent means this process was reparented before the death
     // signal was armed.
     if !parent_is_original(raw_getppid(), image.original_parent) {
-        raw_exit(ARM_FAILED);
+        raw_exit(EXIT_PARENT);
     }
     if write_full(FD_CONTROL, &[RELEASED]).is_err() {
-        raw_exit(ARM_FAILED);
+        raw_exit(EXIT_ACK);
     }
     let mut release = [0_u8; 1];
     if read_full(FD_CONTROL, &mut release).is_err() || release[0] != RELEASED {
-        raw_exit(ARM_FAILED);
+        raw_exit(EXIT_ACK);
     }
     // Leave the runtime's session before the command starts. `kill -STOP 0`
     // in the command must not stop the process that holds the init pidfd.
@@ -825,19 +948,284 @@ fn enter_init(image: &ExecImage) -> ! {
     }
 }
 
+/// How init drops inherited descriptors. `Walk` skips `close_range` and reads
+/// `/proc/self/fd`, which is also the `ENOSYS` fallback.
+#[derive(Clone, Copy)]
+enum CloseFds {
+    Range,
+    #[cfg(test)]
+    Walk,
+    #[cfg(test)]
+    Fail,
+}
+
+enum RangeClose {
+    Done,
+    Fallback,
+    Failed,
+}
+
 /// Dup the control socket and the command's stdout and stderr onto fds 0, 1,
 /// and 2, then close every inherited descriptor from 3 up.
-fn retain_allowlisted_fds(control: i32, stdout: i32, stderr: i32) {
+fn retain_allowlisted_fds(control: i32, stdout: i32, stderr: i32, close_fds: CloseFds) {
     let control = park_above_stdio(control);
     let stdout = park_above_stdio(stdout);
     let stderr = park_above_stdio(stderr);
-    let moved =
-        dup_onto(control, FD_CONTROL) && dup_onto(stdout, FD_STDOUT) && dup_onto(stderr, FD_STDERR);
-    // Safety: fds below 3 are the allowlist installed just above. Flag 0
+    if !(dup_onto(control, FD_CONTROL)
+        && dup_onto(stdout, FD_STDOUT)
+        && dup_onto(stderr, FD_STDERR))
+    {
+        raw_exit(EXIT_INSTALL_FDS);
+    }
+    if !close_inherited_fds(close_fds) {
+        raw_exit(EXIT_CLOSE_FDS);
+    }
+}
+
+/// `close_range` arrived in Linux 5.9. Older kernels return `ENOSYS`. The
+/// fallback lists the descriptors that are actually open. A walk up to the
+/// soft limit misses fds already open above that ceiling, and an unlimited
+/// limit would close empty slots until `i32::MAX` before parent-death is armed.
+fn close_inherited_fds(mode: CloseFds) -> bool {
+    match mode {
+        #[cfg(test)]
+        CloseFds::Fail => false,
+        #[cfg(test)]
+        CloseFds::Walk => close_open_fds_above_stdio(),
+        CloseFds::Range => match close_range_above_stdio() {
+            RangeClose::Done => true,
+            RangeClose::Fallback => close_open_fds_above_stdio(),
+            RangeClose::Failed => false,
+        },
+    }
+}
+
+fn close_range_above_stdio() -> RangeClose {
+    // Safety: fds below 3 are the allowlist installed by the caller. Flag 0
     // closes the range instead of only marking it cloexec.
-    let closed = unsafe { libc::close_range(3, libc::c_uint::MAX, 0) };
-    if !moved || closed < 0 {
-        raw_exit(ARM_FAILED);
+    let rc = unsafe { libc::close_range(3, libc::c_uint::MAX, 0) };
+    let errno = if rc < 0 { last_errno() } else { 0 };
+    range_close_from_result(rc, errno)
+}
+
+fn range_close_from_result(rc: i32, errno: i32) -> RangeClose {
+    if rc == 0 {
+        RangeClose::Done
+    } else if errno == libc::ENOSYS {
+        RangeClose::Fallback
+    } else {
+        RangeClose::Failed
+    }
+}
+
+/// Close every open descriptor above stderr by listing `/proc/self/fd`.
+///
+/// Closing an entry can make the kernel skip later names, so each pass starts
+/// at offset 0 and the scan repeats until a pass closes nothing. The directory
+/// fd stays open until that idle pass. No heap allocation: names are parsed
+/// out of a stack buffer. Every call is a raw syscall. The libc wrappers are
+/// cancellation points, and this runs before `PR_SET_PDEATHSIG`.
+fn close_open_fds_above_stdio() -> bool {
+    let Some(dir) = raw_open_proc_fd_dir() else {
+        return false;
+    };
+    let mut buf = [0_u8; 1024];
+    loop {
+        if !raw_rewind(dir) {
+            let _ = raw_close_fd(dir);
+            return false;
+        }
+        match close_one_proc_pass(dir, &mut buf) {
+            Ok(true) => {}
+            Ok(false) => return raw_close_fd(dir).is_ok(),
+            Err(()) => {
+                let _ = raw_close_fd(dir);
+                return false;
+            }
+        }
+    }
+}
+
+/// `true` when `/proc/self/fd` lists a descriptor above stderr other than the
+/// directory being read. `None` when that directory cannot be read.
+#[cfg(test)]
+fn proc_has_fd_above_stdio() -> Option<bool> {
+    let dir = raw_open_proc_fd_dir()?;
+    let mut buf = [0_u8; 1024];
+    if !raw_rewind(dir) {
+        let _ = raw_close_fd(dir);
+        return None;
+    }
+    let mut found = false;
+    loop {
+        let read = match raw_getdents(dir, &mut buf) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(_) => {
+                let _ = raw_close_fd(dir);
+                return None;
+            }
+        };
+        let mut offset = 0;
+        while offset < read {
+            let Ok((next, fd)) = parse_dirent(&buf[..read], offset) else {
+                let _ = raw_close_fd(dir);
+                return None;
+            };
+            offset = next;
+            if fd.is_some_and(|fd| fd > 2 && fd != dir) {
+                found = true;
+            }
+        }
+    }
+    let _ = raw_close_fd(dir);
+    Some(found)
+}
+
+fn close_one_proc_pass(dir: i32, buf: &mut [u8]) -> Result<bool, ()> {
+    let mut closed_any = false;
+    loop {
+        let read = match raw_getdents(dir, buf) {
+            Ok(0) => return Ok(closed_any),
+            Ok(count) => count,
+            // The cursor can be invalidated by a close earlier in this pass.
+            // The caller restarts from offset 0.
+            Err(_) if closed_any => return Ok(true),
+            Err(_) => return Err(()),
+        };
+        let mut offset = 0;
+        while offset < read {
+            let (next, fd) = parse_dirent(&buf[..read], offset)?;
+            offset = next;
+            let Some(fd) = fd else {
+                continue;
+            };
+            if fd <= 2 || fd == dir {
+                continue;
+            }
+            raw_close_fd(fd)?;
+            closed_any = true;
+        }
+    }
+}
+
+/// `linux_dirent64`: `d_ino` and `d_off` are 8 bytes each, then `d_reclen`,
+/// `d_type`, and a NUL-terminated name. `.` and `..` are not descriptors.
+fn parse_dirent(buf: &[u8], offset: usize) -> Result<(usize, Option<i32>), ()> {
+    let header = offset.checked_add(19).ok_or(())?;
+    if header > buf.len() {
+        return Err(());
+    }
+    let reclen = usize::from(u16::from_ne_bytes([buf[offset + 16], buf[offset + 17]]));
+    let next = offset.checked_add(reclen).ok_or(())?;
+    if reclen < 19 || next > buf.len() {
+        return Err(());
+    }
+    let name = &buf[header..next];
+    let end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    Ok((next, parse_fd_name(&name[..end])))
+}
+
+fn parse_fd_name(name: &[u8]) -> Option<i32> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut value = 0_i32;
+    for &byte in name {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(i32::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn raw_open_proc_fd_dir() -> Option<i32> {
+    let path = c"/proc/self/fd";
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    loop {
+        // Safety: `path` is a NUL-terminated literal. `O_DIRECTORY` does not
+        // create a file, so the mode is unused. `SYS_openat` is not a
+        // cancellation point.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::c_long::from(libc::AT_FDCWD),
+                path.as_ptr(),
+                libc::c_long::from(flags),
+                libc::c_long::from(0_i32),
+            )
+        };
+        if rc >= 0 {
+            return i32::try_from(rc).ok();
+        }
+        if last_errno() != libc::EINTR {
+            return None;
+        }
+    }
+}
+
+fn raw_getdents(dir: i32, buf: &mut [u8]) -> Result<usize, i32> {
+    let count = libc::c_long::try_from(buf.len()).map_err(|_| libc::EINVAL)?;
+    loop {
+        // Safety: `buf` is a writable stack buffer of `count` bytes. The kernel
+        // writes whole `linux_dirent64` records and does not retain the pointer.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                libc::c_long::from(dir),
+                buf.as_mut_ptr(),
+                count,
+            )
+        };
+        if rc >= 0 {
+            return usize::try_from(rc).map_err(|_| libc::EINVAL);
+        }
+        let err = last_errno();
+        if err != libc::EINTR {
+            return Err(err);
+        }
+    }
+}
+
+fn raw_rewind(dir: i32) -> bool {
+    loop {
+        // Safety: rewinding this directory fd to offset 0 restarts the scan.
+        // `SYS_lseek` is not a cancellation point.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_lseek,
+                libc::c_long::from(dir),
+                0_i64,
+                libc::c_long::from(libc::SEEK_SET),
+            )
+        };
+        if rc >= 0 {
+            return true;
+        }
+        if last_errno() != libc::EINTR {
+            return false;
+        }
+    }
+}
+
+fn raw_close_fd(fd: i32) -> Result<(), ()> {
+    // Safety: `SYS_close` drops one descriptor and is not a cancellation point.
+    // On `EINTR` the kernel may already have released it, so this does not
+    // retry: a retry could close a number that was reused. The next pass
+    // closes the number again if it is still open.
+    let rc = unsafe { libc::syscall(libc::SYS_close, libc::c_long::from(fd)) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = last_errno();
+    if err == libc::EINTR || err == libc::EBADF {
+        Ok(())
+    } else {
+        Err(())
     }
 }
 
@@ -987,14 +1375,345 @@ fn read_full(fd: i32, buf: &mut [u8]) -> Result<(), i32> {
 #[allow(unsafe_code)]
 mod tests {
     use super::{
-        classify_reap, clone3, clone3_raw, exit_code_from_waitid, parent_is_original,
-        reap_until_empty, resolve_program_in, signal_pidfd, write_full, write_id_maps, Reap,
+        classify_reap, clone3, clone3_raw, close_inherited_fds, close_open_fds_above_stdio,
+        dup_onto, exit_code_from_wait, exit_code_from_waitid, parent_is_original,
+        proc_has_fd_above_stdio, range_close_from_result, raw_exit, reap_until_empty,
+        resolve_program_in, retain_allowlisted_fds, setup_failure_detail, signal_pidfd, write_full,
+        write_id_maps, CloseFds, RangeClose, Reap, EXIT_ACK, EXIT_CLOSE_FDS, EXIT_INSTALL_FDS,
+        EXIT_PARENT, EXIT_PDEATHSIG,
     };
     use std::ffi::OsStr;
     use std::io::Read;
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn setup_failure_names_the_step_that_exited() {
+        assert!(setup_failure_detail(EXIT_INSTALL_FDS).contains("install allowlisted descriptors"));
+        assert!(setup_failure_detail(EXIT_CLOSE_FDS).contains("close inherited descriptors"));
+        assert!(setup_failure_detail(EXIT_PDEATHSIG).contains("arm parent-death signal"));
+        assert!(setup_failure_detail(EXIT_PARENT).contains("confirm the original parent"));
+        assert!(setup_failure_detail(EXIT_ACK).contains("write the readiness ack"));
+        let other = setup_failure_detail(3);
+        assert!(other.contains("complete containment setup"));
+        assert!(
+            !other.contains("parent-death"),
+            "an unknown exit was blamed on parent-death: {other}"
+        );
+    }
+
+    #[test]
+    fn close_range_enosys_selects_the_fd_walk() {
+        assert!(matches!(
+            range_close_from_result(0, libc::ENOSYS),
+            RangeClose::Done
+        ));
+        assert!(matches!(
+            range_close_from_result(-1, libc::ENOSYS),
+            RangeClose::Fallback
+        ));
+        assert!(matches!(
+            range_close_from_result(-1, libc::EPERM),
+            RangeClose::Failed
+        ));
+        assert!(matches!(
+            range_close_from_result(-1, libc::EINVAL),
+            RangeClose::Failed
+        ));
+    }
+
+    #[test]
+    fn dup_onto_same_fd_clears_cloexec() {
+        let (read, write) = std::io::pipe().expect("pipe");
+        let fd = write.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "fcntl get");
+        assert!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } >= 0,
+            "fcntl set cloexec"
+        );
+        assert!(dup_onto(fd, fd), "same-fd dup should clear cloexec");
+        let cleared = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(cleared >= 0);
+        assert_eq!(cleared & libc::FD_CLOEXEC, 0);
+        assert!(!dup_onto(-1, fd));
+        assert!(!dup_onto(1_000_000, 1_000_000));
+        drop(read);
+    }
+
+    #[test]
+    fn same_fd_cloexec_branch_keeps_stdout_across_exec() {
+        let (mut read, write) = std::io::pipe().expect("pipe");
+        let pid = clone3(0, None, None).expect("fork");
+        if pid == 0 {
+            keep_cloexec_stdout(write.as_raw_fd());
+        }
+        drop(write);
+        let (_, status) = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid),
+            rustix::process::WaitOptions::empty(),
+        )
+        .expect("wait")
+        .expect("child status");
+        let mut got = String::new();
+        read.read_to_string(&mut got).expect("stdout");
+        assert_eq!(exit_code_from_wait(status), 0, "echo exited {got:?}");
+        assert_eq!(got, "kept\n");
+    }
+
+    fn keep_cloexec_stdout(fd: i32) -> ! {
+        unsafe {
+            if libc::dup2(fd, 1) < 0 {
+                raw_exit(2);
+            }
+            if fd != 1 {
+                libc::close(fd);
+            }
+            if libc::fcntl(1, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                raw_exit(3);
+            }
+        }
+        if !dup_onto(1, 1) {
+            raw_exit(4);
+        }
+        unsafe {
+            let program_arg = c"echo";
+            let message = c"kept";
+            let argv = [program_arg.as_ptr(), message.as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null::<libc::c_char>()];
+            libc::execve(c"/bin/echo".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        }
+        raw_exit(5);
+    }
+
+    #[test]
+    fn control_and_pipe_fds_on_stdio_survive_the_allowlist() {
+        let (mut stdout_read, stdout_write) = std::io::pipe().expect("stdout");
+        let (mut stderr_read, stderr_write) = std::io::pipe().expect("stderr");
+        let (mut parent_control, child_control) = super::control_socket().expect("control");
+        let pid = clone3(0, None, None).expect("fork");
+        if pid == 0 {
+            for fd in [
+                stdout_read.as_raw_fd(),
+                stderr_read.as_raw_fd(),
+                parent_control.as_raw_fd(),
+            ] {
+                unsafe { libc::close(fd) };
+            }
+            scramble_stdio_and_retain(
+                child_control.as_raw_fd(),
+                stdout_write.as_raw_fd(),
+                stderr_write.as_raw_fd(),
+            );
+        }
+        drop(stdout_write);
+        drop(stderr_write);
+        drop(child_control);
+        let (_, status) = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid),
+            rustix::process::WaitOptions::empty(),
+        )
+        .expect("wait")
+        .expect("child status");
+        let mut ack = [0_u8; 1];
+        std::io::Read::read_exact(&mut parent_control, &mut ack).expect("ack");
+        let mut out = [0_u8; 3];
+        std::io::Read::read_exact(&mut stdout_read, &mut out).expect("stdout");
+        let mut err = [0_u8; 3];
+        std::io::Read::read_exact(&mut stderr_read, &mut err).expect("stderr");
+        assert_eq!(exit_code_from_wait(status), 0, "allowlist install failed");
+        assert_eq!(ack, [1]);
+        assert_eq!(&out, b"out");
+        assert_eq!(&err, b"err");
+    }
+
+    fn scramble_stdio_and_retain(control: i32, stdout: i32, stderr: i32) -> ! {
+        unsafe {
+            // Park the real ends, then drop stdio so the next dups land on 0, 1,
+            // and 2 in the wrong order. `retain_allowlisted_fds` has to move
+            // them above stdio before installing the allowlist.
+            let hold_control = libc::fcntl(control, libc::F_DUPFD, 3);
+            let hold_stdout = libc::fcntl(stdout, libc::F_DUPFD, 3);
+            let hold_stderr = libc::fcntl(stderr, libc::F_DUPFD, 3);
+            if hold_control < 0 || hold_stdout < 0 || hold_stderr < 0 {
+                raw_exit(2);
+            }
+            libc::close(control);
+            libc::close(stdout);
+            libc::close(stderr);
+            libc::close(0);
+            libc::close(1);
+            libc::close(2);
+            if libc::dup2(hold_stdout, 0) < 0
+                || libc::dup2(hold_control, 1) < 0
+                || libc::dup2(hold_stderr, 2) < 0
+            {
+                raw_exit(3);
+            }
+            libc::close(hold_stdout);
+            libc::close(hold_control);
+            libc::close(hold_stderr);
+        }
+        // control is 1, stdout is 0, stderr is 2.
+        retain_allowlisted_fds(1, 0, 2, CloseFds::Range);
+        if write_full(0, &[1]).is_err()
+            || write_full(1, b"out").is_err()
+            || write_full(2, b"err").is_err()
+        {
+            raw_exit(4);
+        }
+        if proc_has_fd_above_stdio() != Some(false) {
+            raw_exit(5);
+        }
+        raw_exit(0);
+    }
+
+    #[test]
+    fn proc_scan_closes_fds_open_above_a_lowered_soft_limit() {
+        let pid = clone3(0, None, None).expect("fork");
+        if pid == 0 {
+            close_fds_above_lowered_limit();
+        }
+        let (_, status) = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid),
+            rustix::process::WaitOptions::empty(),
+        )
+        .expect("wait")
+        .expect("child status");
+        assert_eq!(
+            exit_code_from_wait(status),
+            0,
+            "an fd above the lowered soft limit stayed open ({})",
+            exit_code_from_wait(status)
+        );
+    }
+
+    fn close_fds_above_lowered_limit() -> ! {
+        unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) != 0 {
+                raw_exit(2);
+            }
+            let ceiling = i32::try_from(limit.rlim_cur).unwrap_or(i32::MAX);
+            if ceiling < 8 {
+                raw_exit(3);
+            }
+            let high = libc::fcntl(0, libc::F_DUPFD, 80.min(ceiling - 1));
+            if high < 3 {
+                raw_exit(4);
+            }
+            // The descriptor is already open. Lowering the soft ceiling to its
+            // number makes it illegal to open again, but it is still open.
+            let Ok(lowered) = libc::rlim_t::try_from(high) else {
+                raw_exit(5);
+            };
+            limit.rlim_cur = lowered;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) != 0 {
+                raw_exit(5);
+            }
+            if !close_open_fds_above_stdio() {
+                raw_exit(6);
+            }
+            let still_open = libc::fcntl(high, libc::F_GETFD) >= 0;
+            let stdio_open = libc::fcntl(0, libc::F_GETFD) >= 0;
+            raw_exit(if !still_open && stdio_open { 0 } else { 7 });
+        }
+    }
+
+    #[test]
+    fn proc_scan_finishes_quickly_at_an_extreme_soft_limit() {
+        let pid = clone3(0, None, None).expect("fork");
+        if pid == 0 {
+            scan_at_extreme_limit();
+        }
+        let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+            panic!("fork returned a pid that is not a process id");
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG) {
+                Ok(Some((_, status))) => {
+                    assert_eq!(
+                        exit_code_from_wait(status),
+                        0,
+                        "extreme-limit scan failed ({})",
+                        exit_code_from_wait(status)
+                    );
+                    return;
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    let _ =
+                        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty());
+                    panic!("descriptor scan was still running after 1s at the maximum soft limit");
+                }
+                Ok(None) | Err(rustix::io::Errno::INTR) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("wait: {err}"),
+            }
+        }
+    }
+
+    fn scan_at_extreme_limit() -> ! {
+        unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) != 0 {
+                raw_exit(2);
+            }
+            // An unlimited ceiling is the case that used to walk `i32::MAX`.
+            // Unprivileged processes cannot raise the hard limit, so a rejected
+            // request falls back to that hard limit, which is still far above
+            // the descriptors this process has open.
+            let mut unlimited = limit;
+            unlimited.rlim_cur = libc::RLIM_INFINITY;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const unlimited) != 0 {
+                limit.rlim_cur = limit.rlim_max;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) != 0 {
+                    raw_exit(3);
+                }
+            }
+            let high = libc::fcntl(0, libc::F_DUPFD, 3);
+            if high < 3 {
+                raw_exit(4);
+            }
+            let mut start = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            if libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut start) != 0 {
+                raw_exit(5);
+            }
+            if !close_open_fds_above_stdio() {
+                raw_exit(6);
+            }
+            let mut end = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            if libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut end) != 0 {
+                raw_exit(7);
+            }
+            let elapsed_ns =
+                (end.tv_sec - start.tv_sec) * 1_000_000_000 + (end.tv_nsec - start.tv_nsec);
+            if elapsed_ns > 200_000_000 || libc::fcntl(high, libc::F_GETFD) >= 0 {
+                raw_exit(8);
+            }
+            raw_exit(0);
+        }
+    }
+
+    #[test]
+    fn close_range_failure_does_not_report_success() {
+        assert!(!close_inherited_fds(CloseFds::Fail));
+    }
 
     #[test]
     fn wait_error_is_not_a_timeout_even_at_the_deadline() {
