@@ -133,3 +133,106 @@ impl From<VarError> for ApiError {
         Self::InvalidApiKeyEnv(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::env::VarError;
+    use std::io;
+    use std::time::Duration;
+
+    use super::ApiError;
+
+    fn typed_api_error(retryable: bool) -> ApiError {
+        ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some(String::from("rate_limit_error")),
+            message: Some(String::from("slow down")),
+            body: String::from("raw"),
+            retryable,
+        }
+    }
+
+    #[test]
+    fn classifies_retryable_failures_including_exhausted_retries() {
+        assert!(typed_api_error(true).is_retryable());
+        assert!(!typed_api_error(false).is_retryable());
+
+        let exhausted = ApiError::RetriesExhausted {
+            attempts: 3,
+            last_error: Box::new(typed_api_error(true)),
+        };
+        assert!(exhausted.is_retryable());
+        assert_eq!(
+            exhausted.to_string(),
+            "api failed after 3 attempts: api returned 429 Too Many Requests (rate_limit_error): slow down"
+        );
+
+        let terminal = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(typed_api_error(false)),
+        };
+        assert!(!terminal.is_retryable());
+    }
+
+    #[test]
+    fn formats_credential_auth_and_transport_errors() {
+        let missing =
+            ApiError::missing_credentials("anthropic", &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]);
+        assert!(!missing.is_retryable());
+        assert_eq!(
+            missing.to_string(),
+            "missing anthropic credentials; export ANTHROPIC_API_KEY or CLAUDE_API_KEY before calling the anthropic API"
+        );
+        let _error: &dyn std::error::Error = &missing;
+
+        assert!(!ApiError::ExpiredOAuthToken.is_retryable());
+        assert!(ApiError::ExpiredOAuthToken.to_string().contains("expired"));
+
+        let auth = ApiError::Auth(String::from("bad token"));
+        assert_eq!(auth.to_string(), "auth error: bad token");
+        assert!(!auth.is_retryable());
+
+        let env_error = ApiError::from(VarError::NotPresent);
+        assert!(matches!(
+            env_error,
+            ApiError::InvalidApiKeyEnv(VarError::NotPresent)
+        ));
+        assert!(env_error.to_string().contains("environment variable"));
+
+        let io_error = ApiError::from(io::Error::new(io::ErrorKind::NotFound, "missing"));
+        assert!(matches!(io_error, ApiError::Io(_)));
+        assert!(io_error.to_string().contains("io error: missing"));
+
+        let json_error =
+            ApiError::from(serde_json::from_str::<serde_json::Value>("{").unwrap_err());
+        assert!(matches!(json_error, ApiError::Json(_)));
+        assert!(json_error.to_string().contains("json error"));
+
+        let frame = ApiError::InvalidSseFrame("missing data");
+        assert_eq!(frame.to_string(), "invalid sse frame: missing data");
+        assert!(!frame.is_retryable());
+
+        let overflow = ApiError::BackoffOverflow {
+            attempt: 8,
+            base_delay: Duration::from_secs(30),
+        };
+        assert!(!overflow.is_retryable());
+        assert!(overflow
+            .to_string()
+            .contains("attempt 8 with base delay 30s"));
+    }
+
+    #[test]
+    fn formats_api_errors_without_a_typed_message_from_the_body() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: None,
+            message: Some(String::from("ignored without a type")),
+            body: String::from("nope"),
+            retryable: false,
+        };
+
+        assert_eq!(error.to_string(), "api returned 400 Bad Request: nope");
+        assert!(!error.is_retryable());
+    }
+}

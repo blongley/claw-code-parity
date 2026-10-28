@@ -1,10 +1,12 @@
 mod hooks;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -1063,6 +1065,7 @@ impl PluginManager {
     }
 
     pub fn plugin_registry_report(&self) -> Result<PluginRegistryReport, PluginError> {
+        let _install_lock = plugin_install_lock();
         self.sync_bundled_plugins()?;
 
         let mut discovery = PluginDiscovery::default();
@@ -1109,6 +1112,7 @@ impl PluginManager {
     }
 
     pub fn install(&mut self, source: &str) -> Result<InstallOutcome, PluginError> {
+        let _install_lock = plugin_install_lock();
         let install_source = parse_install_source(source)?;
         let temp_root = self.install_root().join(".tmp");
         let staged_source = materialize_source(&install_source, &temp_root)?;
@@ -1170,6 +1174,7 @@ impl PluginManager {
     }
 
     pub fn uninstall(&mut self, plugin_id: &str) -> Result<(), PluginError> {
+        let _install_lock = plugin_install_lock();
         let mut registry = self.load_registry()?;
         let record = registry.plugins.remove(plugin_id).ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
@@ -1190,6 +1195,7 @@ impl PluginManager {
     }
 
     pub fn update(&mut self, plugin_id: &str) -> Result<UpdateOutcome, PluginError> {
+        let _install_lock = plugin_install_lock();
         let mut registry = self.load_registry()?;
         let record = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
@@ -1345,6 +1351,7 @@ impl PluginManager {
     }
 
     pub fn installed_plugin_registry_report(&self) -> Result<PluginRegistryReport, PluginError> {
+        let _install_lock = plugin_install_lock();
         self.sync_bundled_plugins()?;
         Ok(self.build_registry_report(self.discover_installed_plugins_with_failures()?))
     }
@@ -1384,10 +1391,8 @@ impl PluginManager {
                 continue;
             }
 
-            if install_path.exists() {
-                fs::remove_dir_all(&install_path)?;
-            }
-            copy_dir_all(&source_root, &install_path)?;
+            fs::create_dir_all(&install_root)?;
+            replace_tree(&source_root, &install_path)?;
 
             let installed_at_unix_ms =
                 existing_record.map_or(now, |record| record.installed_at_unix_ms);
@@ -2118,7 +2123,12 @@ fn discover_plugin_dirs(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
             let mut paths = Vec::new();
             for entry in entries {
                 let path = entry?.path();
-                if path.is_dir() && plugin_manifest_path(&path).is_ok() {
+                let hidden = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'));
+                // Staging directories (`.tmp`, `.<id>.sync`) are not installed plugins.
+                if path.is_dir() && !hidden && plugin_manifest_path(&path).is_ok() {
                     paths.push(path);
                 }
             }
@@ -2156,6 +2166,40 @@ fn unix_time_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .expect("time should be after epoch")
         .as_millis()
+}
+
+/// Serializes install-tree readers and writers. `cargo test` loads the
+/// default plugin home from many threads; a sync that deletes and recopies
+/// a bundle otherwise lets another thread observe a manifest whose hook
+/// files have not been written yet.
+fn plugin_install_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Replaces `destination` with a copy of `source`. The copy is staged in a
+/// hidden sibling so discovery never walks a half-written plugin directory.
+fn replace_tree(source: &Path, destination: &Path) -> Result<(), PluginError> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut staging_name = OsString::from(".");
+    staging_name.push(destination.file_name().unwrap_or_default());
+    staging_name.push(".sync");
+    let staging = parent.join(staging_name);
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    copy_dir_all(source, &staging)?;
+    if destination.exists() {
+        fs::remove_dir_all(destination)?;
+    }
+    if let Err(error) = fs::rename(&staging, destination) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(PluginError::Io(error));
+    }
+    Ok(())
 }
 
 fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), PluginError> {
@@ -2449,8 +2493,8 @@ mod tests {
 
         let manifest = load_plugin_from_directory(&root).expect("packaged manifest should load");
         assert_eq!(manifest.name, "packaged-demo");
-        assert!(manifest.tools.is_empty());
-        assert!(manifest.commands.is_empty());
+        assert_eq!(manifest.tools, [] as [PluginToolManifest; 0]);
+        assert_eq!(manifest.commands, [] as [PluginCommandManifest; 0]);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2468,10 +2512,10 @@ mod tests {
         );
 
         let manifest = load_plugin_from_directory(&root).expect("minimal manifest should load");
-        assert!(manifest.permissions.is_empty());
+        assert_eq!(manifest.permissions, [] as [PluginPermission; 0]);
         assert!(manifest.hooks.is_empty());
-        assert!(manifest.tools.is_empty());
-        assert!(manifest.commands.is_empty());
+        assert_eq!(manifest.tools, [] as [PluginToolManifest; 0]);
+        assert_eq!(manifest.commands, [] as [PluginCommandManifest; 0]);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2798,6 +2842,44 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn bundled_sync_restores_installed_copy_missing_hook_files() {
+        let config_home = temp_dir("bundled-repair-home");
+        let bundled_root = temp_dir("bundled-repair-root");
+        let source = bundled_root.join("example");
+        write_file(
+            source.join("hooks").join("pre.sh").as_path(),
+            "#!/bin/sh\nprintf 'pre'\n",
+        );
+        write_file(
+            source.join("hooks").join("post.sh").as_path(),
+            "#!/bin/sh\nprintf 'post'\n",
+        );
+        write_file(
+            source.join(MANIFEST_RELATIVE_PATH).as_path(),
+            "{\n  \"name\": \"example\",\n  \"version\": \"0.1.0\",\n  \"description\": \"bundled plugin\",\n  \"hooks\": {\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"]\n  }\n}",
+        );
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        let manager = PluginManager::new(config);
+        manager
+            .list_installed_plugins()
+            .expect("initial bundled sync should succeed");
+        let install_path = manager.install_root().join("example-bundled");
+        fs::remove_file(install_path.join("hooks").join("pre.sh")).expect("remove pre hook");
+        fs::remove_file(install_path.join("hooks").join("post.sh")).expect("remove post hook");
+
+        manager
+            .plugin_registry()
+            .expect("a bundled install missing hook files should be recopied before it is loaded");
+        assert!(install_path.join("hooks").join("pre.sh").is_file());
+        assert!(install_path.join("hooks").join("post.sh").is_file());
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
     }
 
     #[test]

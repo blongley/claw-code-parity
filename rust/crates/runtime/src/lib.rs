@@ -2,6 +2,8 @@ mod bash;
 mod bootstrap;
 mod compact;
 mod config;
+#[cfg(target_os = "linux")]
+mod contain;
 mod conversation;
 mod file_ops;
 mod hooks;

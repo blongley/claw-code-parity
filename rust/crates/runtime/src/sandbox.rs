@@ -1,6 +1,11 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use serde::{Deserialize, Serialize};
 
@@ -161,19 +166,28 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let container = detect_container_environment();
-    let namespace_supported = cfg!(target_os = "linux") && command_exists("unshare");
-    let network_supported = namespace_supported;
+    // `unshare` being on `PATH` does not mean it can create namespaces. Ubuntu
+    // and nested CI hosts often reject user namespaces, and the launcher then
+    // exits before the shell runs. Probe the launcher once. Callers decide
+    // whether that failure can fall back or must fail closed.
+    let support = namespace_support();
+    let namespace_supported = support.operational;
+    let network_supported = support.operational;
     let filesystem_active =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
     let mut fallback_reasons = Vec::new();
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
-        fallback_reasons
-            .push("namespace isolation unavailable (requires Linux with `unshare`)".to_string());
+        fallback_reasons.push(isolation_unavailable_reason(
+            "namespace",
+            support.binary_present,
+        ));
     }
     if request.enabled && request.network_isolation && !network_supported {
-        fallback_reasons
-            .push("network isolation unavailable (requires Linux with `unshare`)".to_string());
+        fallback_reasons.push(isolation_unavailable_reason(
+            "network",
+            support.binary_present,
+        ));
     }
     if request.enabled
         && request.filesystem_mode == FilesystemIsolationMode::AllowList
@@ -282,10 +296,109 @@ fn command_exists(command: &str) -> bool {
         .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).exists()))
 }
 
+#[derive(Clone, Copy)]
+struct NamespaceSupport {
+    binary_present: bool,
+    operational: bool,
+}
+
+fn namespace_support() -> NamespaceSupport {
+    static SUPPORT: OnceLock<NamespaceSupport> = OnceLock::new();
+    #[cfg(test)]
+    if let Some(support) = NAMESPACE_SUPPORT_OVERRIDE.with(Cell::get) {
+        return support;
+    }
+    *SUPPORT.get_or_init(|| {
+        let binary_present = cfg!(target_os = "linux") && command_exists("unshare");
+        NamespaceSupport {
+            binary_present,
+            operational: binary_present && unshare_launcher_works(),
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static NAMESPACE_SUPPORT_OVERRIDE: Cell<Option<NamespaceSupport>> = const { Cell::new(None) };
+}
+
+/// Forces the cached namespace probe for the current test thread.
+#[cfg(test)]
+#[must_use = "the probe override ends when this guard is dropped"]
+pub(crate) struct NamespaceSupportOverride;
+
+#[cfg(test)]
+pub(crate) fn override_namespace_support(
+    operational: bool,
+    binary_present: bool,
+) -> NamespaceSupportOverride {
+    NAMESPACE_SUPPORT_OVERRIDE.with(|cell| {
+        cell.set(Some(NamespaceSupport {
+            binary_present,
+            operational,
+        }));
+    });
+    NamespaceSupportOverride
+}
+
+#[cfg(test)]
+impl Drop for NamespaceSupportOverride {
+    fn drop(&mut self) {
+        NAMESPACE_SUPPORT_OVERRIDE.with(|cell| cell.set(None));
+    }
+}
+
+fn unshare_launcher_works() -> bool {
+    let process_id = std::process::id();
+    let root = env::temp_dir().join(format!("claw-sandbox-probe-{process_id}"));
+    let home = root.join("home");
+    let tmp = root.join("tmp");
+    if fs::create_dir_all(&home).is_err() || fs::create_dir_all(&tmp).is_err() {
+        let _ = fs::remove_dir_all(&root);
+        return false;
+    }
+
+    let works = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--ipc",
+            "--pid",
+            "--uts",
+            "--fork",
+            "sh",
+            "-lc",
+            "printf probe",
+        ])
+        .env("HOME", &home)
+        .env("TMPDIR", &tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("probe")
+        });
+    let _ = fs::remove_dir_all(&root);
+    works
+}
+
+fn isolation_unavailable_reason(kind: &str, binary_present: bool) -> String {
+    if binary_present {
+        format!(
+            "{kind} isolation unavailable (`unshare` cannot create a user, mount, and pid namespace)"
+        )
+    } else {
+        format!("{kind} isolation unavailable (requires Linux with `unshare`)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_linux_sandbox_command, detect_container_environment_from, FilesystemIsolationMode,
+        build_linux_sandbox_command, detect_container_environment_from,
+        isolation_unavailable_reason, resolve_sandbox_status_for_request, FilesystemIsolationMode,
         SandboxConfig, SandboxDetectionInputs,
     };
     use std::path::Path;
@@ -358,7 +471,49 @@ mod tests {
         {
             assert_eq!(launcher.program, "unshare");
             assert!(launcher.args.iter().any(|arg| arg == "--mount"));
-            assert!(launcher.args.iter().any(|arg| arg == "--net") == status.network_active);
+            assert_eq!(
+                launcher.args.iter().any(|arg| arg == "--net"),
+                status.network_active
+            );
+        }
+    }
+
+    #[test]
+    fn describes_why_namespace_isolation_is_unavailable() {
+        assert_eq!(
+            isolation_unavailable_reason("namespace", false),
+            "namespace isolation unavailable (requires Linux with `unshare`)"
+        );
+        assert_eq!(
+            isolation_unavailable_reason("network", true),
+            "network isolation unavailable (`unshare` cannot create a user, mount, and pid namespace)"
+        );
+    }
+
+    #[test]
+    fn namespace_status_follows_whether_unshare_can_run_a_command() {
+        let config = SandboxConfig::default();
+        let status = resolve_sandbox_status_for_request(
+            &config.resolve_request(
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(FilesystemIsolationMode::WorkspaceOnly),
+                None,
+            ),
+            Path::new("/workspace"),
+        );
+
+        if status.namespace_active {
+            assert!(
+                build_linux_sandbox_command("printf probe", Path::new("/workspace"), &status)
+                    .is_some()
+            );
+        } else {
+            let reason = status
+                .fallback_reason
+                .expect("inactive namespaces should explain the fallback");
+            assert!(reason.contains("namespace isolation unavailable"));
         }
     }
 }
