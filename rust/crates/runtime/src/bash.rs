@@ -1,8 +1,11 @@
 use std::env;
+use std::ffi::OsStr;
 use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -132,15 +135,19 @@ fn execute_with_timeout(
     dangerously_disable_sandbox: Option<bool>,
     sandbox_status: SandboxStatus,
 ) -> io::Result<BashCommandOutput> {
+    // A pid namespace makes `setsid` descendants children of the supervisor
+    // (pid 1). The supervisor reaps them and exits only after they do; killing
+    // the supervisor tears the namespace down, so a new session cannot outlive
+    // the deadline. Stdout and stderr are drained concurrently so a full pipe
+    // cannot stall the command past that deadline.
+    let supervise_in_pid_namespace = pid_namespace_supervisor_available();
+    if supervise_in_pid_namespace {
+        command = command_in_pid_namespace(&command);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // `sh -lc` forks the requested program. The shell and its descendants share
-    // a process group so the timeout can signal the whole tree. Stdout and
-    // stderr are drained concurrently: a full pipe would otherwise stall the
-    // command, and waiting for those pipes only after the shell exits would
-    // drop the deadline while a descendant still holds them.
     #[cfg(unix)]
     {
         command.process_group(0);
@@ -148,7 +155,12 @@ fn execute_with_timeout(
     let mut child = command.spawn()?;
     let stdout_reader = spawn_reader(child.stdout.take());
     let stderr_reader = spawn_reader(child.stderr.take());
-    let wait_result = wait_for_process_group(&mut child, Duration::from_millis(timeout_ms));
+    let timeout = Duration::from_millis(timeout_ms);
+    let wait_result = if supervise_in_pid_namespace {
+        wait_for_child(&mut child, timeout)
+    } else {
+        wait_for_process_group(&mut child, timeout)
+    };
     if wait_result.is_err() {
         terminate_process_group(&mut child, false);
     }
@@ -198,9 +210,134 @@ fn join_reader(handle: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Waits until `child` and every member of its process group have exited, or
-/// until `timeout` elapses. `Some` is the shell status after the group is
-/// empty. `None` means the deadline fired and the group was killed.
+/// Supervisor script run as pid 1 inside `unshare --pid`. It records the
+/// shell status, reaps every descendant (including `setsid` orphans and
+/// zombies), and exits only when nothing else in the namespace is alive.
+const PID_NAMESPACE_SUPERVISOR: &str = r#"
+target=$1
+sh -c "$target" &
+child=$!
+status=0
+wait "$child" || status=$?
+alive() {
+  for entry in /proc/[0-9]*; do
+    pid=${entry##*/}
+    if [ "$pid" = "1" ]; then
+      continue
+    fi
+    stat=$(cat "$entry/stat" 2>/dev/null) || continue
+    rest=${stat#*)}
+    rest=${rest# }
+    state=${rest%% *}
+    if [ "$state" != "Z" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+while alive; do
+  wait || true
+  sleep 0.05
+done
+wait || true
+exit "$status"
+"#;
+
+fn pid_namespace_supervisor_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+                "--kill-child",
+                "--",
+                "sh",
+                "-c",
+                "printf ok",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"ok")
+    })
+}
+
+fn command_in_pid_namespace(command: &Command) -> Command {
+    let line = command_line(command);
+    let current_dir = command.get_current_dir().map(PathBuf::from);
+    let envs = command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+        .collect::<Vec<_>>();
+    let mut supervised = Command::new("unshare");
+    supervised.args([
+        "--user",
+        "--map-root-user",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        "--kill-child",
+        "--",
+        "sh",
+        "-c",
+        PID_NAMESPACE_SUPERVISOR,
+        "sh",
+        &line,
+    ]);
+    if let Some(dir) = current_dir {
+        supervised.current_dir(dir);
+    }
+    for (key, value) in envs {
+        match value {
+            Some(value) => {
+                supervised.env(key, value);
+            }
+            None => {
+                supervised.env_remove(key);
+            }
+        }
+    }
+    supervised
+}
+
+fn command_line(command: &Command) -> String {
+    let mut parts = Vec::new();
+    parts.push(shell_quote(&command.get_program().to_string_lossy()));
+    for arg in command.get_args() {
+        parts.push(shell_quote(&arg.to_string_lossy()));
+    }
+    parts.join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn wait_for_child(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if started.elapsed() >= timeout {
+            terminate_process_group(child, false);
+            return Ok(None);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(Duration::from_millis(10).min(remaining));
+    }
+}
+
+/// Waits until `child` and every live member of its process group have exited,
+/// or until `timeout` elapses. Zombies are not members: a finished child that
+/// has not been reaped yet must not turn a completed command into a timeout.
+/// `Some` is the shell status after the group is empty. `None` means the
+/// deadline fired and the group was killed.
 fn wait_for_process_group(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
     let started = Instant::now();
     let group_id = child.id();
@@ -260,7 +397,7 @@ fn process_group_has_members(pgid: u32) -> bool {
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
-        if process_group_id(&stat) == Some(pgid) {
+        if stat_is_live_group_member(&stat, pgid) {
             return true;
         }
     }
@@ -293,6 +430,19 @@ fn process_group_id(stat: &str) -> Option<u32> {
     let _state = fields.next()?;
     let _ppid = fields.next()?;
     fields.next()?.parse().ok()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn process_state(stat: &str) -> Option<&str> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    after_comm.split_whitespace().next()
+}
+
+/// A zombie still occupies its process group until something reaps it. It is
+/// not running the command.
+#[cfg(any(test, target_os = "linux"))]
+fn stat_is_live_group_member(stat: &str, pgid: u32) -> bool {
+    process_group_id(stat) == Some(pgid) && process_state(stat) != Some("Z")
 }
 
 fn refused_network_isolation(status: &SandboxStatus) -> Option<io::Error> {
@@ -562,6 +712,22 @@ mod tests {
     }
 
     #[test]
+    fn zombie_process_group_members_are_not_alive() {
+        assert!(super::stat_is_live_group_member(
+            "1249 (sleep) S 298 1249 1249 0",
+            1249
+        ));
+        assert!(!super::stat_is_live_group_member(
+            "1249 (sleep) Z 298 1249 1249 0",
+            1249
+        ));
+        assert!(!super::stat_is_live_group_member(
+            "12 (my proc) Z 1 99 12",
+            99
+        ));
+    }
+
+    #[test]
     fn timed_command_drains_stdout_and_stderr_together() {
         let _guard = crate::test_env_lock();
         // Each iteration writes a full pipe buffer to stdout and then stderr.
@@ -597,21 +763,22 @@ for _ in range(6):
     #[test]
     fn timeout_covers_descendants_after_the_shell_exits() {
         let _guard = crate::test_env_lock();
+        let token = unique_token("group");
         let started = std::time::Instant::now();
         let output = execute_bash(unsandboxed(
-            "sleep 5 >/dev/null 2>&1 & echo $!",
+            &format!("sh -c 'sleep 5' {token} >/dev/null 2>&1 & echo armed"),
             Some(300),
             false,
         ))
         .expect("descendant timeout should return");
         let elapsed = started.elapsed();
-        let pid = background_pid(&output.stdout);
-        let mut cleanup = KillOnDrop(Some(pid));
+        let mut cleanup = KillMatching(Some(token.clone()));
 
         assert!(
             output.interrupted,
             "descendant was still running after the shell exited"
         );
+        assert!(output.stdout.contains("armed"));
         assert_eq!(
             output.return_code_interpretation.as_deref(),
             Some("timeout")
@@ -624,26 +791,99 @@ for _ in range(6):
             elapsed < std::time::Duration::from_secs(2),
             "timeout returned after {elapsed:?}; the shell exit ended the wait"
         );
-        assert_pid_gone(pid);
+        assert_no_process_matching(&token);
         cleanup.disarm();
+    }
+
+    #[test]
+    fn timeout_kills_a_detached_session_leader() {
+        let _guard = crate::test_env_lock();
+        let token = unique_token("setsid");
+        let started = std::time::Instant::now();
+        let output = execute_bash(unsandboxed(
+            &format!("setsid sh -c 'sleep 30' {token} >/dev/null 2>&1 </dev/null & echo armed"),
+            Some(300),
+            false,
+        ))
+        .expect("detached descendant should be bounded by the timeout");
+        let elapsed = started.elapsed();
+        let mut cleanup = KillMatching(Some(token.clone()));
+
+        assert!(
+            output.interrupted,
+            "setsid child escaped the timeout, stdout {} stderr {}",
+            output.stdout, output.stderr
+        );
+        assert!(output.stdout.contains("armed"));
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "timeout returned after {elapsed:?}, before the deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout returned after {elapsed:?}"
+        );
+        assert_no_process_matching(&token);
+        cleanup.disarm();
+    }
+
+    #[test]
+    fn finished_command_is_not_a_timeout_when_it_leaves_a_zombie() {
+        let _guard = crate::test_env_lock();
+        let started = std::time::Instant::now();
+        let output = execute_bash(unsandboxed(
+            r#"python3 -c 'import os,sys
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+sys.stdout.write("done\n")
+sys.stdout.flush()
+os._exit(0)
+'"#,
+            Some(2_000),
+            false,
+        ))
+        .expect("zombie child should not fail the command");
+        let elapsed = started.elapsed();
+
+        assert!(
+            !output.interrupted,
+            "zombie was treated as a running descendant: {}",
+            output.stderr
+        );
+        assert!(output.stdout.contains("done"));
+        assert_eq!(output.return_code_interpretation, None);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "returned after {elapsed:?}; an unreaped zombie kept the deadline open"
+        );
     }
 
     #[test]
     fn timeout_still_bounds_a_descendant_holding_the_output_pipes() {
         let _guard = crate::test_env_lock();
+        let token = unique_token("pipe");
         let started = std::time::Instant::now();
-        let output = execute_bash(unsandboxed("sleep 5 & echo $!", Some(300), false))
-            .expect("piped descendant should not block past the timeout");
+        let output = execute_bash(unsandboxed(
+            &format!("sh -c 'sleep 5' {token} & echo armed"),
+            Some(300),
+            false,
+        ))
+        .expect("piped descendant should not block past the timeout");
         let elapsed = started.elapsed();
-        let pid = background_pid(&output.stdout);
-        let mut cleanup = KillOnDrop(Some(pid));
+        let mut cleanup = KillMatching(Some(token.clone()));
 
-        assert!(output.interrupted);
+        assert!(output.interrupted, "{}", output.stderr);
+        assert!(output.stdout.contains("armed"));
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "waited {elapsed:?} for a descendant that kept stdout open"
         );
-        assert_pid_gone(pid);
+        assert_no_process_matching(&token);
         cleanup.disarm();
     }
 
@@ -725,56 +965,49 @@ for _ in range(6):
         assert!(!status.active);
     }
 
-    fn background_pid(stdout: &str) -> u32 {
-        stdout
-            .split_whitespace()
-            .next()
-            .and_then(|token| token.parse().ok())
-            .expect("background pid")
+    fn unique_token(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        format!("claw-{label}-{}-{nanos}", std::process::id())
     }
 
-    fn assert_pid_gone(pid: u32) {
+    fn assert_no_process_matching(token: &str) {
         #[cfg(target_os = "linux")]
         {
             for _ in 0..50 {
-                if !linux_pid_is_alive(pid) {
+                let output = std::process::Command::new("ps")
+                    .args(["-eo", "args"])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .expect("ps should list processes");
+                let text = String::from_utf8_lossy(&output.stdout);
+                if !text.lines().any(|line| line.contains(token)) {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            panic!("descendant {pid} was still running after the timeout");
+            panic!("process matching {token} was still running after the timeout");
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = pid;
+            let _ = token;
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn linux_pid_is_alive(pid: u32) -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        // `Z` is a zombie waiting to be reaped. The timeout already killed it.
-        let Some((_, after_comm)) = stat.rsplit_once(')') else {
-            return true;
-        };
-        after_comm.split_whitespace().next() != Some("Z")
-    }
+    struct KillMatching(Option<String>);
 
-    struct KillOnDrop(Option<u32>);
-
-    impl KillOnDrop {
+    impl KillMatching {
         fn disarm(&mut self) {
             self.0 = None;
         }
     }
 
-    impl Drop for KillOnDrop {
+    impl Drop for KillMatching {
         fn drop(&mut self) {
-            if let Some(pid) = self.0 {
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
+            if let Some(token) = self.0.take() {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-KILL", "-f", &token])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
