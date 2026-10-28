@@ -90,7 +90,13 @@ fn supervise() -> io::Result<()> {
         Err(cgroup_err) => match spawn_pid_namespace(&status_path, &command) {
             Ok(unshare) => {
                 status.line(&format!("mode pidns {}", unshare.id()))?;
-                supervise_pid_namespace(&mut status, unshare, &status_path, deadline)
+                supervise_pid_namespace(
+                    &mut status,
+                    unshare,
+                    &status_path,
+                    deadline,
+                    &one_line(&cgroup_err),
+                )
             }
             Err(pidns_err) => {
                 status.line("mode none")?;
@@ -252,10 +258,11 @@ fn supervise_pid_namespace(
     mut unshare: Child,
     status_path: &Path,
     deadline: Instant,
+    cgroup_error: &str,
 ) -> io::Result<()> {
     loop {
         if let Some(exit) = unshare.try_wait()? {
-            return finish_pid_namespace(status, status_path, exit_code(exit), false);
+            return finish_pid_namespace(status, status_path, exit_code(exit), false, cgroup_error);
         }
         if Instant::now() >= deadline {
             if unshare.try_wait()?.is_none() {
@@ -263,7 +270,7 @@ fn supervise_pid_namespace(
             }
             let exited = wait_for_child(&mut unshare, EMPTY_WAIT)?;
             return if let Some(exit) = exited {
-                finish_pid_namespace(status, status_path, exit_code(exit), true)
+                finish_pid_namespace(status, status_path, exit_code(exit), true, cgroup_error)
             } else {
                 status.line("result unkillable")?;
                 Ok(())
@@ -278,9 +285,12 @@ fn finish_pid_namespace(
     status_path: &Path,
     code: i32,
     killed_for_timeout: bool,
+    cgroup_error: &str,
 ) -> io::Result<()> {
     if !status_contains(status_path, "inner ready") {
-        status.line("result unavailable pid namespace did not start the supervisor")?;
+        status.line(&format!(
+            "result unavailable pid namespace did not start the supervisor (exit {code}); cgroup: {cgroup_error}"
+        ))?;
         return Ok(());
     }
     if killed_for_timeout {

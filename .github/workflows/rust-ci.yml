@@ -67,4 +67,19 @@ jobs:
         with:
           workspaces: rust -> target
       - name: Run workspace tests
-        run: cargo test --workspace
+        run: |
+          # Timed bash commands need a cgroup v2 they can create children in.
+          # GitHub-hosted runners do not delegate the job cgroup, and they
+          # block unprivileged user namespaces, so the pid-namespace fallback
+          # cannot start either. Root moves this step into a memory domain;
+          # the supervisor then creates its own child cgroup underneath.
+          base=/sys/fs/cgroup/claw-delegate
+          sudo mkdir -p "$base"
+          if ! grep -qw memory "$base/cgroup.subtree_control"; then
+            echo '+memory' | sudo tee "$base/cgroup.subtree_control" >/dev/null
+          fi
+          sudo mkdir -p "$base/job"
+          sudo chown "$(id -u):$(id -g)" "$base/job"
+          echo $$ | sudo tee "$base/job/cgroup.procs" >/dev/null
+          echo "bash containment cgroup: $(cat /proc/self/cgroup)"
+          cargo test --workspace
