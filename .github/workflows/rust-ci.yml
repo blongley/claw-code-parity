@@ -75,11 +75,14 @@ jobs:
           # the supervisor then creates its own child cgroup underneath.
           base=/sys/fs/cgroup/claw-delegate
           sudo mkdir -p "$base"
+          sudo chown "$(id -u):$(id -g)" "$base"
           if ! grep -qw memory "$base/cgroup.subtree_control"; then
             echo '+memory' | sudo tee "$base/cgroup.subtree_control" >/dev/null
           fi
-          sudo mkdir -p "$base/job"
-          sudo chown "$(id -u):$(id -g)" "$base/job"
+          # The job directory must be created by this user. A root-created
+          # cgroup keeps `cgroup.procs` owned by root, and moving a child into
+          # a nested cgroup is then EACCES.
+          mkdir -p "$base/job"
           echo $$ | sudo tee "$base/job/cgroup.procs" >/dev/null
           echo "bash containment cgroup: $(cat /proc/self/cgroup)"
           cargo test --workspace
