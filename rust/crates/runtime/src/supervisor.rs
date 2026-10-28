@@ -391,22 +391,35 @@ fn write_finished(
     code: i32,
     timed_out: bool,
 ) -> io::Result<()> {
-    if let Some(detail) = note_with_prefix(status_path, "init-wait ") {
-        status.line(&format!("result unkillable {}", one_line_str(&detail)))?;
-        return Ok(());
-    }
-    if !status_contains(status_path, "inner ready") {
-        status.line(&format!(
-            "result unavailable pid namespace did not start the command (exit {code})"
-        ))?;
-        return Ok(());
+    let wait_error = note_with_prefix(status_path, "init-wait ");
+    let line = outcome_after_init(
+        status_contains(status_path, "inner ready"),
+        timed_out,
+        code,
+        wait_error.as_deref(),
+    );
+    status.line(&line)
+}
+
+/// A deadline that kills init is a timeout even when the command has not
+/// written `inner ready` yet. A spontaneous exit before that line means the
+/// namespace never started the command.
+fn outcome_after_init(
+    inner_ready: bool,
+    timed_out: bool,
+    code: i32,
+    wait_error: Option<&str>,
+) -> String {
+    if let Some(detail) = wait_error {
+        return format!("result unkillable {}", one_line_str(detail));
     }
     if timed_out {
-        status.line("result timeout")?;
-    } else {
-        status.line(&format!("result ok {code}"))?;
+        return "result timeout".to_string();
     }
-    Ok(())
+    if !inner_ready {
+        return format!("result unavailable pid namespace did not start the command (exit {code})");
+    }
+    format!("result ok {code}")
 }
 
 /// Pid 1 of the command's pid namespace. Reaps until `ECHILD`. Killing this
@@ -771,6 +784,22 @@ mod tests {
             }
             other => panic!("expected the kill error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn timeout_before_inner_ready_is_still_a_timeout() {
+        assert_eq!(
+            super::outcome_after_init(false, true, 1, None),
+            "result timeout"
+        );
+        assert_eq!(
+            super::outcome_after_init(false, false, 1, None),
+            "result unavailable pid namespace did not start the command (exit 1)"
+        );
+        assert_eq!(
+            super::outcome_after_init(true, false, 0, None),
+            "result ok 0"
+        );
     }
 
     #[test]
