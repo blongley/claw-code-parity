@@ -1,8 +1,12 @@
+#[cfg(all(test, unix))]
+use std::cell::Cell;
 #[cfg(target_os = "linux")]
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -10,6 +14,9 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use rustix::event::{PollFd, PollFlags, Timespec};
 
 use serde::{Deserialize, Serialize};
 
@@ -138,12 +145,11 @@ fn execute_with_timeout(
     sandbox_status: SandboxStatus,
 ) -> io::Result<BashCommandOutput> {
     // Detached descendants (`setsid`, a new process group) leave the shell's
-    // process group. A pid-namespace supervisor keeps them in one tree and
-    // reaps them. Where that namespace is unavailable, a child subreaper
-    // adopts the orphans so the deadline can still kill them. Stdout and
-    // stderr are drained concurrently so a full pipe cannot stall the command.
+    // process group. A subreaper adopts those orphans. A pid namespace is the
+    // fallback. Stdout and stderr are drained until the same deadline, then
+    // the pipe is closed so a detached writer cannot block the join.
     let supervision = supervision_mode();
-    if let Some(supervised) = supervised_command(&command, supervision) {
+    if let Some(supervised) = supervised_command(&command, supervision)? {
         command = supervised;
     }
     command
@@ -155,35 +161,46 @@ fn execute_with_timeout(
         command.process_group(0);
     }
     let mut child = command.spawn()?;
-    let stdout_reader = spawn_reader(child.stdout.take());
-    let stderr_reader = spawn_reader(child.stderr.take());
     let timeout = Duration::from_millis(timeout_ms);
+    let deadline = Instant::now() + timeout;
+    let stdout_reader = spawn_reader(child.stdout.take(), deadline);
+    let stderr_reader = spawn_reader(child.stderr.take(), deadline);
     let wait_result = match supervision {
         Supervision::ProcessGroup => wait_for_process_group(&mut child, timeout),
         Supervision::PidNamespace | Supervision::Subreaper => wait_for_child(&mut child, timeout),
     };
-    if wait_result.is_err() {
-        terminate_child_tree(&mut child, false);
-    }
     let stdout = join_reader(stdout_reader);
     let stderr = join_reader(stderr_reader);
+    let readers_timed_out = matches!(&stdout, Ok(read) if read.timed_out)
+        || matches!(&stderr, Ok(read) if read.timed_out);
+    let deadline_hit = readers_timed_out || wait_result.is_err() || matches!(wait_result, Ok(None));
+    if deadline_hit {
+        let shell_reaped = matches!(wait_result, Ok(Some(_)));
+        terminate_child_tree(&mut child, shell_reaped);
+    }
+    // Process-group membership cannot see a `setsid` child. Returning success
+    // once the group is empty reports a command as finished while that child
+    // is still running. Readers have already stopped at `deadline`.
+    #[cfg(unix)]
+    if supervision == Supervision::ProcessGroup {
+        return Err(containment_unavailable());
+    }
     let status = wait_result?;
     let stdout = stdout?;
     let stderr = stderr?;
-
     match status {
-        Some(status) => Ok(completed_output(
+        Some(status) if !stdout.timed_out && !stderr.timed_out => Ok(completed_output(
             &Output {
                 status,
-                stdout,
-                stderr,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
             },
             dangerously_disable_sandbox,
             sandbox_status,
         )),
-        None => Ok(timed_out_output(
-            &stdout,
-            &stderr,
+        _ => Ok(timed_out_output(
+            &stdout.bytes,
+            &stderr.bytes,
             timeout_ms,
             dangerously_disable_sandbox,
             sandbox_status,
@@ -191,24 +208,119 @@ fn execute_with_timeout(
     }
 }
 
-fn spawn_reader(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<io::Result<Vec<u8>>> {
+struct PipeRead {
+    bytes: Vec<u8>,
+    timed_out: bool,
+}
+
+#[cfg(unix)]
+fn spawn_reader(
+    pipe: Option<impl Read + AsFd + Send + 'static>,
+    deadline: Instant,
+) -> JoinHandle<io::Result<PipeRead>> {
     thread::spawn(move || match pipe {
-        Some(mut pipe) => {
-            let mut buffer = Vec::new();
-            pipe.read_to_end(&mut buffer)?;
-            Ok(buffer)
-        }
-        None => Ok(Vec::new()),
+        Some(pipe) => read_pipe_until(pipe, deadline),
+        None => Ok(PipeRead {
+            bytes: Vec::new(),
+            timed_out: false,
+        }),
     })
 }
 
-fn join_reader(handle: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+#[cfg(not(unix))]
+fn spawn_reader(
+    pipe: Option<impl Read + Send + 'static>,
+    deadline: Instant,
+) -> JoinHandle<io::Result<PipeRead>> {
+    let _ = deadline;
+    thread::spawn(move || match pipe {
+        Some(mut pipe) => {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes)?;
+            Ok(PipeRead {
+                bytes,
+                timed_out: false,
+            })
+        }
+        None => Ok(PipeRead {
+            bytes: Vec::new(),
+            timed_out: false,
+        }),
+    })
+}
+
+/// Reads until EOF or `deadline`. Returning drops `pipe`, which closes the
+/// read end. The following join is bounded by that same deadline.
+#[cfg(unix)]
+fn read_pipe_until(mut pipe: impl Read + AsFd, deadline: Instant) -> io::Result<PipeRead> {
+    let mut bytes = Vec::new();
+    let mut buf = [0_u8; 8_192];
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(PipeRead {
+                bytes,
+                timed_out: true,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(timeout) = Timespec::try_from(remaining) else {
+            return Ok(PipeRead {
+                bytes,
+                timed_out: true,
+            });
+        };
+        let events = {
+            let mut fds = [PollFd::new(&pipe, PollFlags::IN)];
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Ok(0) => {
+                    return Ok(PipeRead {
+                        bytes,
+                        timed_out: true,
+                    });
+                }
+                Ok(_) => fds[0].revents(),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(err) => return Err(err.into()),
+            }
+        };
+        if events.contains(PollFlags::NVAL) {
+            return Err(io::Error::other("command output pipe is not pollable"));
+        }
+        if !events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+            continue;
+        }
+        match pipe.read(&mut buf) {
+            Ok(0) => {
+                return Ok(PipeRead {
+                    bytes,
+                    timed_out: false,
+                });
+            }
+            Ok(count) => bytes.extend_from_slice(&buf[..count]),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn join_reader(handle: JoinHandle<io::Result<PipeRead>>) -> io::Result<PipeRead> {
     match handle.join() {
         Ok(result) => result,
         Err(_) => Err(io::Error::other(
             "command output reader stopped unexpectedly",
         )),
     }
+}
+
+#[cfg(unix)]
+fn containment_unavailable() -> io::Error {
+    io::Error::other(
+        "cannot contain detached child processes (no subreaper or pid namespace); refusing to report the command as finished",
+    )
 }
 
 /// Supervisor script run as pid 1 inside `unshare --pid`. It records the
@@ -251,10 +363,38 @@ enum Supervision {
     ProcessGroup,
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static SUPERVISION_OVERRIDE: Cell<Option<Supervision>> = const { Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+#[must_use = "the supervision override ends when this guard is dropped"]
+struct SupervisionOverride;
+
+#[cfg(all(test, unix))]
+fn override_supervision(mode: Supervision) -> SupervisionOverride {
+    SUPERVISION_OVERRIDE.with(|cell| cell.set(Some(mode)));
+    SupervisionOverride
+}
+
+#[cfg(all(test, unix))]
+impl Drop for SupervisionOverride {
+    fn drop(&mut self) {
+        SUPERVISION_OVERRIDE.with(|cell| cell.set(None));
+    }
+}
+
 fn supervision_mode() -> Supervision {
+    #[cfg(all(test, unix))]
+    if let Some(mode) = SUPERVISION_OVERRIDE.with(Cell::get) {
+        return mode;
+    }
     // A child subreaper does not need a user namespace. Hosts that block
     // unprivileged `unshare --user` still adopt `setsid` orphans this way.
-    // The pid namespace is the fallback when Python cannot call prctl.
+    // The pid namespace is the fallback when that subreaper cannot be started.
+    // Process-group tracking cannot see detached children, so that mode
+    // refuses to report the command as finished.
     if subreaper_supervisor_available() {
         Supervision::Subreaper
     } else if pid_namespace_supervisor_available() {
@@ -264,11 +404,11 @@ fn supervision_mode() -> Supervision {
     }
 }
 
-fn supervised_command(command: &Command, supervision: Supervision) -> Option<Command> {
+fn supervised_command(command: &Command, supervision: Supervision) -> io::Result<Option<Command>> {
     match supervision {
-        Supervision::PidNamespace => Some(command_in_pid_namespace(command)),
-        Supervision::Subreaper => Some(command_in_subreaper(command)),
-        Supervision::ProcessGroup => None,
+        Supervision::PidNamespace => Ok(Some(command_in_pid_namespace(command))),
+        Supervision::Subreaper => command_in_subreaper(command).map(Some),
+        Supervision::ProcessGroup => Ok(None),
     }
 }
 
@@ -296,109 +436,45 @@ fn pid_namespace_supervisor_available() -> bool {
     })
 }
 
-/// `PR_SET_CHILD_SUBREAPER`. Orphans of the command are reparented here instead
-/// of to init, including processes that called `setsid`.
-const SUBREAPER_SUPERVISOR: &str = r#"
-import ctypes, os, signal, subprocess, sys, time
-PR_SET_CHILD_SUBREAPER = 36
-libc = ctypes.CDLL(None, use_errno=True)
-if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
-    raise SystemExit(127)
-target = sys.argv[1]
-child = subprocess.Popen(["sh", "-c", target])
-shell_status = None
-
-def reap():
-    global shell_status
-    while True:
-        try:
-            pid, status = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if pid == 0:
-            return
-        if pid == child.pid and shell_status is None:
-            shell_status = os.waitstatus_to_exitcode(status)
-
-def read_stat(pid):
-    try:
-        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as handle:
-            data = handle.read()
-    except OSError:
-        return None
-    marker = data.rfind(")")
-    if marker < 0:
-        return None
-    fields = data[marker + 1:].split()
-    if len(fields) < 3:
-        return None
-    return fields[0], int(fields[1])
-
-def live_descendants():
-    root = os.getpid()
-    info = {}
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
-        parsed = read_stat(int(name))
-        if parsed is not None:
-            info[int(name)] = parsed
-    live = []
-    for pid, (state, _ppid) in info.items():
-        if state == "Z" or pid == root:
-            continue
-        seen = set()
-        current = pid
-        while current not in seen:
-            seen.add(current)
-            parent = info.get(current, (None, None))[1]
-            if parent in (None, 0, current):
-                break
-            if parent == root:
-                live.append(pid)
-                break
-            current = parent
-    return live
-
-def kill_descendants():
-    for pid in live_descendants():
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    try:
-        os.kill(child.pid, signal.SIGKILL)
-    except OSError:
-        pass
-    reap()
-
-def on_term(_signum, _frame):
-    kill_descendants()
-    raise SystemExit(128 + signal.SIGTERM)
-
-signal.signal(signal.SIGTERM, on_term)
-while True:
-    reap()
-    if shell_status is not None and not live_descendants():
-        reap()
-        raise SystemExit(shell_status if 0 <= shell_status < 256 else 128)
-    time.sleep(0.01)
-"#;
-
 fn subreaper_supervisor_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new("python3")
-            .args([
-                "-c",
-                "import ctypes,sys\nlibc=ctypes.CDLL(None, use_errno=True)\nsys.exit(0 if libc.prctl(36, 1, 0, 0, 0) == 0 else 1)",
-            ])
+        let Some(program) = supervisor_program() else {
+            return false;
+        };
+        // Probe outside the workspace. The supervisor is a Rust binary, so a
+        // local `ctypes.py` or a PATH-shadowed `python3` cannot run here.
+        Command::new(program)
+            .arg("exit 0")
+            .current_dir(env::temp_dir())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
     })
+}
+
+/// Absolute path to the Rust subreaper. Never resolved through `PATH`.
+fn supervisor_program() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("CLAWD_BASH_SUPERVISOR") {
+        let path = PathBuf::from(path);
+        if path.is_absolute() && path.is_file() {
+            return Some(path);
+        }
+    }
+    let exe = env::current_exe().ok()?;
+    supervisor_beside(&exe).or_else(|| supervisor_beside(&exe.canonicalize().ok()?))
+}
+
+fn supervisor_beside(exe: &std::path::Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    let near = dir.join("bash-supervisor");
+    if near.is_file() {
+        return Some(near);
+    }
+    let above = dir.parent()?.join("bash-supervisor");
+    above.is_file().then_some(above)
 }
 
 fn command_in_pid_namespace(command: &Command) -> Command {
@@ -421,14 +497,17 @@ fn command_in_pid_namespace(command: &Command) -> Command {
     supervised
 }
 
-fn command_in_subreaper(command: &Command) -> Command {
+fn command_in_subreaper(command: &Command) -> io::Result<Command> {
+    let program = supervisor_program().ok_or_else(|| {
+        io::Error::other("bash supervisor is unavailable; cannot contain detached child processes")
+    })?;
     let line = command_line(command);
-    let mut supervised = command_with_context("python3", command);
-    supervised.args(["-c", SUBREAPER_SUPERVISOR, &line]);
-    supervised
+    let mut supervised = command_with_context(&program, command);
+    supervised.arg(line);
+    Ok(supervised)
 }
 
-fn command_with_context(program: &str, source: &Command) -> Command {
+fn command_with_context(program: impl AsRef<OsStr>, source: &Command) -> Command {
     let current_dir = source.get_current_dir().map(PathBuf::from);
     let envs = source
         .get_envs()
@@ -1198,6 +1277,140 @@ os._exit(0)
         let status = output.sandbox_status.expect("sandbox status");
         assert!(!status.network_active);
         assert!(!status.active);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subreaper_program_is_the_rust_supervisor() {
+        let program = super::supervisor_program()
+            .expect("bash-supervisor should be built next to the test binary");
+        assert_eq!(
+            program.file_name().and_then(|name| name.to_str()),
+            Some("bash-supervisor")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_fallback_refuses_to_report_success() {
+        let _guard = crate::test_env_lock();
+        let _mode = super::override_supervision(super::Supervision::ProcessGroup);
+        let started = std::time::Instant::now();
+        let error = execute_bash(unsandboxed("printf hi", Some(1_000), false))
+            .expect_err("process group cannot contain detached children");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "returned after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            error.to_string(),
+            super::containment_unavailable().to_string()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_fallback_bounds_a_detached_pipe_holder() {
+        let _guard = crate::test_env_lock();
+        let _mode = super::override_supervision(super::Supervision::ProcessGroup);
+        let token = unique_token("pg-setsid");
+        let started = std::time::Instant::now();
+        let error = execute_bash(unsandboxed(
+            &format!("setsid sh -c 'sleep 30' {token} & echo armed"),
+            Some(300),
+            false,
+        ))
+        .expect_err("a detached child holding stdout must not hang the fallback");
+        let elapsed = started.elapsed();
+        let _cleanup = KillMatching(Some(token));
+
+        assert_eq!(
+            error.to_string(),
+            super::containment_unavailable().to_string()
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "returned after {elapsed:?}, before the reader deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "returned after {elapsed:?}; the reader join had no deadline"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_does_not_execute_a_path_shadowed_python() {
+        const CHILD: &str = "CLAWD_SUPERVISOR_SHADOW_CHILD";
+        const MARKER: &str = "CLAWD_SUPERVISOR_SHADOW_MARKER";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = std::env::temp_dir().join(unique_token("py-shadow"));
+            std::fs::create_dir_all(&dir).expect("shadow dir should be created");
+            let marker = dir.join("python-ran");
+            let done = dir.join("done");
+            write_executable(
+                &dir.join("python3"),
+                "#!/bin/sh\ntouch \"$CLAWD_SUPERVISOR_SHADOW_MARKER\"\nexit 1\n",
+            );
+            let site = "import os\np=os.environ.get('CLAWD_SUPERVISOR_SHADOW_MARKER')\nif p:\n    open(p,'a').close()\n";
+            std::fs::write(dir.join("sitecustomize.py"), site).expect("sitecustomize");
+            std::fs::write(dir.join("ctypes.py"), site).expect("ctypes shadow");
+            let mut path = std::ffi::OsString::from(dir.as_os_str());
+            path.push(":");
+            if let Some(current) = std::env::var_os("PATH") {
+                path.push(current);
+            }
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test binary should be available"),
+            )
+            .args([
+                "--exact",
+                "bash::tests::supervisor_does_not_execute_a_path_shadowed_python",
+                "--test-threads=1",
+            ])
+            .current_dir(&dir)
+            .env(CHILD, "1")
+            .env(MARKER, &marker)
+            .env("PATH", &path)
+            .output()
+            .expect("shadow test should re-exec");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let ran = marker.exists();
+            let finished = done.exists();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                output.status.success() && finished && !ran,
+                "status {:?} finished {finished} python-ran {ran}\n{stdout}\n{stderr}",
+                output.status.code()
+            );
+            return;
+        }
+
+        let _guard = crate::test_env_lock();
+        let marker = std::env::var(MARKER).expect("marker path");
+        let output = execute_bash(unsandboxed("printf hello", Some(1_000), false))
+            .expect("command should run without python");
+        assert_eq!(output.stdout, "hello");
+        assert!(
+            !std::path::Path::new(&marker).exists(),
+            "supervisor executed python3"
+        );
+        let done = std::path::Path::new(&marker).with_file_name("done");
+        std::fs::write(done, "ok").expect("done marker");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).expect("executable script should be written");
+        let mut permissions = std::fs::metadata(path)
+            .expect("executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("executable bit");
     }
 
     fn unique_token(label: &str) -> String {
