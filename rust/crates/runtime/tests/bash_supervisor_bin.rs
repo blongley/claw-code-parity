@@ -12,6 +12,7 @@ fn cargo_builds_the_bash_supervisor_binary() {
         "bash-supervisor was not built at {program}"
     );
     let output = std::process::Command::new(program)
+        .arg("1000")
         .arg("exit 0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

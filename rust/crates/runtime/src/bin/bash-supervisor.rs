@@ -3,13 +3,17 @@
 //! Timed commands need a process that outlives `setsid`. Doing that with
 //! `python3 -c` from the workspace puts the workspace on Python's import
 //! path, so local code runs outside the sandbox. This program enables
-//! `PR_SET_CHILD_SUBREAPER` itself and exits only after the shell and every
-//! reparented descendant have been reaped.
+//! `PR_SET_CHILD_SUBREAPER` itself, enforces the caller's deadline, and exits
+//! only after `waitpid` returns `ECHILD`.
 
 use std::io;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Exit status the parent treats as a timeout when it arrives at the deadline.
+const TIMEOUT_EXIT: i32 = 124;
 
 fn main() {
     let code = supervise().unwrap_or(127);
@@ -25,38 +29,78 @@ fn supervise() -> io::Result<i32> {
 
 #[cfg(target_os = "linux")]
 fn supervise() -> io::Result<i32> {
-    let mut args = std::env::args();
-    let _argv0 = args.next();
-    let Some(line) = args.next() else {
-        return Err(io::Error::other("bash supervisor requires a command"));
-    };
+    let (timeout_ms, line) = parse_args()?;
     // `Some(Pid::INIT)` is the prctl boolean, not a request to adopt pid 1.
     rustix::process::set_child_subreaper(Some(rustix::process::Pid::INIT))?;
 
-    let child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(line)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    let shell = rustix::process::Pid::from_child(&child);
-    let root = std::process::id();
+    // Best-effort: a child cgroup lets `cgroup.kill` reach descendants that
+    // fork during teardown. The supervisor stays in its original cgroup so
+    // that kill does not hit this process. `ECHILD` is still the proof.
+    let cgroup = ShellCgroup::create();
+    let shell = {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(line)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let shell = rustix::process::Pid::from_child(&child);
+        if let Some(cgroup) = &cgroup {
+            cgroup.adopt(child.id());
+        }
+        // `Child`'s destructor does not wait or signal. `wait(-1)` below is
+        // the only reap, so dropping the handle must not race with it.
+        shell
+    };
+
+    let deadline = Instant::now() + duration_from_millis(timeout_ms);
     let mut shell_status = None;
     loop {
-        reap(shell, &mut shell_status)?;
-        if let Some(status) = shell_status {
-            if !has_live_descendant(root) {
-                reap(shell, &mut shell_status)?;
-                return Ok(shell_status.unwrap_or(status));
+        if reap(shell, &mut shell_status)? == Reap::NoChildren {
+            if let Some(status) = shell_status {
+                return Ok(status);
             }
+            return Err(io::Error::other("shell exited without a status"));
+        }
+        if Instant::now() >= deadline {
+            kill_until_echild(cgroup.as_ref())?;
+            return Ok(TIMEOUT_EXIT);
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
 
 #[cfg(target_os = "linux")]
-fn reap(shell: rustix::process::Pid, shell_status: &mut Option<i32>) -> io::Result<()> {
+fn parse_args() -> io::Result<(u64, String)> {
+    let mut args = std::env::args();
+    let _argv0 = args.next();
+    let Some(timeout) = args.next() else {
+        return Err(io::Error::other("bash supervisor requires a timeout"));
+    };
+    let Some(line) = args.next() else {
+        return Err(io::Error::other("bash supervisor requires a command"));
+    };
+    let timeout_ms = timeout.parse::<u64>().map_err(|_| {
+        io::Error::other("bash supervisor timeout must be a number of milliseconds")
+    })?;
+    Ok((timeout_ms, line))
+}
+
+#[cfg(target_os = "linux")]
+fn duration_from_millis(ms: u64) -> Duration {
+    Duration::from_millis(ms.min(u64::MAX / 1_000_000))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reap {
+    ChildrenRemain,
+    NoChildren,
+}
+
+#[cfg(target_os = "linux")]
+fn reap(shell: rustix::process::Pid, shell_status: &mut Option<i32>) -> io::Result<Reap> {
     loop {
         match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
             Ok(Some((pid, status))) => {
@@ -66,7 +110,8 @@ fn reap(shell: rustix::process::Pid, shell_status: &mut Option<i32>) -> io::Resu
                     }
                 }
             }
-            Ok(None) | Err(rustix::io::Errno::CHILD) => return Ok(()),
+            Ok(None) => return Ok(Reap::ChildrenRemain),
+            Err(rustix::io::Errno::CHILD) => return Ok(Reap::NoChildren),
             Err(rustix::io::Errno::INTR) => {}
             Err(err) => return Err(err.into()),
         }
@@ -83,67 +128,112 @@ fn finished_code(status: rustix::process::WaitStatus) -> Option<i32> {
         .map(|signal| 128_i32.saturating_add(signal))
 }
 
-/// A zombie still has a pid until it is reaped. It is not running the command.
+/// Signal every adopted child, then reap, until `waitpid` returns `ECHILD`.
+///
+/// A single `/proc` snapshot misses a process that forks after the scan.
+/// `ECHILD` is the proof that nothing is left, including zombies.
 #[cfg(target_os = "linux")]
-fn has_live_descendant(root: u32) -> bool {
+fn kill_until_echild(cgroup: Option<&ShellCgroup>) -> io::Result<()> {
+    let give_up = Instant::now() + Duration::from_millis(750);
+    loop {
+        signal_adopted_children(cgroup);
+        match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
+            Ok(None) => {
+                if Instant::now() >= give_up {
+                    return Err(io::Error::other(
+                        "descendants were still alive after SIGKILL",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(rustix::io::Errno::CHILD) => return Ok(()),
+            Ok(Some(_)) | Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_adopted_children(cgroup: Option<&ShellCgroup>) {
+    if let Some(cgroup) = cgroup {
+        cgroup.kill_all();
+    }
+    let me = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return true;
+        return;
     };
-    let mut parents = std::collections::HashMap::<u32, u32>::new();
-    let mut alive = Vec::new();
     for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        if pid == root {
+        if pid == me {
             continue;
         }
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
-        let Some((state, parent)) = stat_state_and_parent(&stat) else {
+        if stat_parent(&stat) != Some(me) {
+            continue;
+        }
+        let Some(raw) = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        else {
             continue;
         };
-        parents.insert(pid, parent);
-        if state != "Z" {
-            alive.push(pid);
-        }
+        let _ = rustix::process::kill_process(raw, rustix::process::Signal::KILL);
     }
-    alive
-        .into_iter()
-        .any(|pid| descends_from(pid, root, &parents))
 }
 
 #[cfg(target_os = "linux")]
-fn descends_from(mut pid: u32, root: u32, parents: &std::collections::HashMap<u32, u32>) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    while seen.insert(pid) {
-        let Some(parent) = parents.get(&pid).copied() else {
-            return false;
-        };
-        if parent == root {
-            return true;
-        }
-        if parent == 0 || parent == pid {
-            return false;
-        }
-        pid = parent;
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn stat_state_and_parent(stat: &str) -> Option<(&str, u32)> {
+fn stat_parent(stat: &str) -> Option<u32> {
     let (_, after_comm) = stat.rsplit_once(')')?;
     let mut fields = after_comm.split_whitespace();
-    let state = fields.next()?;
-    let parent = fields.next()?.parse().ok()?;
-    Some((state, parent))
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+/// A cgroup that contains the shell and not the supervisor.
+#[cfg(target_os = "linux")]
+struct ShellCgroup {
+    dir: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl ShellCgroup {
+    fn create() -> Option<Self> {
+        let listing = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let relative = listing.lines().find_map(|line| line.strip_prefix("0::"))?;
+        let parent = PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        let dir = parent.join(format!("bash-supervisor-{}", std::process::id()));
+        if std::fs::create_dir(&dir).is_err() {
+            return None;
+        }
+        if !dir.join("cgroup.kill").is_file() {
+            let _ = std::fs::remove_dir(&dir);
+            return None;
+        }
+        Some(Self { dir })
+    }
+
+    fn adopt(&self, pid: u32) {
+        let _ = std::fs::write(self.dir.join("cgroup.procs"), pid.to_string());
+    }
+
+    fn kill_all(&self) {
+        let kill = self.dir.join("cgroup.kill");
+        if kill.is_file() {
+            let _ = std::fs::write(kill, "1");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ShellCgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.dir);
+    }
 }

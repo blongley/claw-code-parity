@@ -4912,11 +4912,32 @@ mod tests {
         let _ = fs::remove_file(empty_notebook);
     }
 
+    fn stage_bash_supervisor_beside_test_exe() {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = exe.parent() else {
+            return;
+        };
+        let dest = dir.join("bash-supervisor");
+        if fs::symlink_metadata(&dest).is_ok_and(|meta| meta.file_type().is_file()) {
+            return;
+        }
+        let Some(src_dir) = dir.parent() else {
+            return;
+        };
+        let src = src_dir.join("bash-supervisor");
+        if src.is_file() {
+            let _ = fs::hard_link(&src, &dest);
+        }
+    }
+
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stage_bash_supervisor_beside_test_exe();
         let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");

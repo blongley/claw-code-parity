@@ -1,7 +1,5 @@
 #[cfg(all(test, unix))]
 use std::cell::Cell;
-#[cfg(target_os = "linux")]
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Read};
@@ -9,7 +7,7 @@ use std::io::{self, Read};
 use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
@@ -139,19 +137,25 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
 }
 
 fn execute_with_timeout(
-    mut command: Command,
+    command: Command,
     timeout_ms: u64,
     dangerously_disable_sandbox: Option<bool>,
     sandbox_status: SandboxStatus,
 ) -> io::Result<BashCommandOutput> {
     // Detached descendants (`setsid`, a new process group) leave the shell's
     // process group. A subreaper adopts those orphans. A pid namespace is the
-    // fallback. Stdout and stderr are drained until the same deadline, then
-    // the pipe is closed so a detached writer cannot block the join.
+    // fallback. Process-group tracking cannot see them, so that mode refuses
+    // before the command is started.
     let supervision = supervision_mode();
-    if let Some(supervised) = supervised_command(&command, supervision)? {
-        command = supervised;
+    #[cfg(unix)]
+    if supervision == Supervision::ProcessGroup {
+        return Err(containment_unavailable());
     }
+    let mut command = match supervision {
+        Supervision::PidNamespace => command_in_pid_namespace(&command),
+        Supervision::Subreaper => command_in_subreaper(&command, timeout_ms)?,
+        Supervision::ProcessGroup => command,
+    };
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -160,51 +164,86 @@ fn execute_with_timeout(
     {
         command.process_group(0);
     }
-    let mut child = command.spawn()?;
+    let mut tracked = TrackedChild::spawn(command)?;
     let timeout = Duration::from_millis(timeout_ms);
-    let deadline = Instant::now() + timeout;
-    let stdout_reader = spawn_reader(child.stdout.take(), deadline);
-    let stderr_reader = spawn_reader(child.stderr.take(), deadline);
-    let wait_result = match supervision {
-        Supervision::ProcessGroup => wait_for_process_group(&mut child, timeout),
-        Supervision::PidNamespace | Supervision::Subreaper => wait_for_child(&mut child, timeout),
-    };
-    let stdout = join_reader(stdout_reader);
-    let stderr = join_reader(stderr_reader);
-    let readers_timed_out = matches!(&stdout, Ok(read) if read.timed_out)
-        || matches!(&stderr, Ok(read) if read.timed_out);
-    let deadline_hit = readers_timed_out || wait_result.is_err() || matches!(wait_result, Ok(None));
-    if deadline_hit {
-        let shell_reaped = matches!(wait_result, Ok(Some(_)));
-        terminate_child_tree(&mut child, shell_reaped);
-    }
-    // Process-group membership cannot see a `setsid` child. Returning success
-    // once the group is empty reports a command as finished while that child
-    // is still running. Readers have already stopped at `deadline`.
-    #[cfg(unix)]
-    if supervision == Supervision::ProcessGroup {
-        return Err(containment_unavailable());
-    }
-    let status = wait_result?;
-    let stdout = stdout?;
-    let stderr = stderr?;
-    match status {
-        Some(status) if !stdout.timed_out && !stderr.timed_out => Ok(completed_output(
-            &Output {
-                status,
-                stdout: stdout.bytes,
-                stderr: stderr.bytes,
-            },
-            dangerously_disable_sandbox,
-            sandbox_status,
-        )),
-        _ => Ok(timed_out_output(
+    let started = Instant::now();
+    // The subreaper kills its own descendants and exits at the deadline.
+    // Readers stay open through that teardown so closing a pipe is not what
+    // stops the command. A stuck supervisor is signaled once, after grace.
+    let grace = supervision_grace(supervision);
+    let reader_deadline = started + timeout + grace;
+    let stdout_reader = spawn_reader(tracked.child.stdout.take(), reader_deadline);
+    let stderr_reader = spawn_reader(tracked.child.stderr.take(), reader_deadline);
+    let status = tracked.wait_until(started + timeout, grace)?;
+    let signaled = tracked.signaled;
+    let stdout = join_reader(stdout_reader)?;
+    let stderr = join_reader(stderr_reader)?;
+    if command_timed_out(
+        supervision,
+        status.as_ref(),
+        started.elapsed(),
+        timeout,
+        signaled,
+        stdout.timed_out,
+        stderr.timed_out,
+    ) {
+        return Ok(timed_out_output(
             &stdout.bytes,
             &stderr.bytes,
             timeout_ms,
             dangerously_disable_sandbox,
             sandbox_status,
-        )),
+        ));
+    }
+    let status = status.ok_or_else(|| io::Error::other("command ended without a status"))?;
+    Ok(completed_output(
+        &Output {
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        },
+        dangerously_disable_sandbox,
+        sandbox_status,
+    ))
+}
+
+/// The supervisor process exits with this status after it has killed every
+/// adopted child. A command that exits 124 well before the deadline keeps
+/// that status; a 124 that arrives at the deadline is a timeout.
+const SUPERVISOR_TIMEOUT_EXIT: i32 = 124;
+
+fn supervision_grace(mode: Supervision) -> Duration {
+    match mode {
+        // Teardown runs inside the supervisor. This grace is only the
+        // backstop for a supervisor that never exits.
+        Supervision::Subreaper => Duration::from_secs(1),
+        Supervision::PidNamespace | Supervision::ProcessGroup => Duration::ZERO,
+    }
+}
+
+fn command_timed_out(
+    supervision: Supervision,
+    status: Option<&ExitStatus>,
+    elapsed: Duration,
+    timeout: Duration,
+    signaled: bool,
+    stdout_timed_out: bool,
+    stderr_timed_out: bool,
+) -> bool {
+    let Some(status) = status else {
+        return true;
+    };
+    if signaled {
+        return true;
+    }
+    match supervision {
+        Supervision::Subreaper => {
+            status.code() == Some(SUPERVISOR_TIMEOUT_EXIT)
+                && elapsed + Duration::from_millis(50) >= timeout
+        }
+        Supervision::PidNamespace | Supervision::ProcessGroup => {
+            stdout_timed_out || stderr_timed_out
+        }
     }
 }
 
@@ -394,21 +433,13 @@ fn supervision_mode() -> Supervision {
     // unprivileged `unshare --user` still adopt `setsid` orphans this way.
     // The pid namespace is the fallback when that subreaper cannot be started.
     // Process-group tracking cannot see detached children, so that mode
-    // refuses to report the command as finished.
+    // refuses to start the command.
     if subreaper_supervisor_available() {
         Supervision::Subreaper
     } else if pid_namespace_supervisor_available() {
         Supervision::PidNamespace
     } else {
         Supervision::ProcessGroup
-    }
-}
-
-fn supervised_command(command: &Command, supervision: Supervision) -> io::Result<Option<Command>> {
-    match supervision {
-        Supervision::PidNamespace => Ok(Some(command_in_pid_namespace(command))),
-        Supervision::Subreaper => command_in_subreaper(command).map(Some),
-        Supervision::ProcessGroup => Ok(None),
     }
 }
 
@@ -445,6 +476,7 @@ fn subreaper_supervisor_available() -> bool {
         // Probe outside the workspace. The supervisor is a Rust binary, so a
         // local `ctypes.py` or a PATH-shadowed `python3` cannot run here.
         Command::new(program)
+            .arg("1000")
             .arg("exit 0")
             .current_dir(env::temp_dir())
             .stdin(Stdio::null())
@@ -456,31 +488,93 @@ fn subreaper_supervisor_available() -> bool {
 }
 
 /// Absolute path to the Rust subreaper. Never resolved through `PATH`.
+///
+/// An explicit absolute path is accepted only when it passes
+/// [`trusted_supervisor`]. Otherwise the only candidate is `bash-supervisor`
+/// in the same directory as the current executable. Nothing above that
+/// directory is searched, and symlinks are not followed.
 fn supervisor_program() -> Option<PathBuf> {
-    // `cargo test` exposes the real binary to integration tests. Unit tests
-    // find the same file next to `target/debug` once that build has run.
     for key in ["CLAWD_BASH_SUPERVISOR", "CARGO_BIN_EXE_bash-supervisor"] {
-        if let Some(path) = absolute_executable(env::var_os(key)) {
-            return Some(path);
+        if let Some(value) = env::var_os(key) {
+            if let Some(found) = accepted_supervisor(Path::new(&value)) {
+                return Some(found);
+            }
         }
     }
+    // Unit-test harnesses live under `target/debug/deps` and do not receive
+    // `CARGO_BIN_EXE_bash-supervisor`. Place the already-built binary beside
+    // the harness so the production check above can see it. This is not a
+    // lookup used to execute a parent path.
+    #[cfg(test)]
+    stage_supervisor_for_harness();
     let exe = env::current_exe().ok()?;
-    supervisor_beside(&exe).or_else(|| supervisor_beside(&exe.canonicalize().ok()?))
+    supervisor_next_to(&exe)
 }
 
-fn absolute_executable(path: Option<impl AsRef<OsStr>>) -> Option<PathBuf> {
-    let path = PathBuf::from(path?.as_ref());
-    (path.is_absolute() && path.is_file()).then_some(path)
+fn accepted_supervisor(path: &Path) -> Option<PathBuf> {
+    (path.is_absolute() && trusted_supervisor(path)).then(|| path.to_path_buf())
 }
 
-fn supervisor_beside(exe: &std::path::Path) -> Option<PathBuf> {
-    let dir = exe.parent()?;
-    let near = dir.join("bash-supervisor");
-    if near.is_file() {
-        return Some(near);
+fn supervisor_next_to(exe: &Path) -> Option<PathBuf> {
+    let beside = exe.parent()?.join("bash-supervisor");
+    accepted_supervisor(&beside)
+}
+
+fn trusted_supervisor(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    // `symlink_metadata` does not follow links. A symlink is not a regular file.
+    if !meta.file_type().is_file() {
+        return false;
     }
-    let above = dir.parent()?.join("bash-supervisor");
-    above.is_file().then_some(above)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o002 != 0 {
+            return false;
+        }
+        if !supervisor_owner_is_trusted(file_owner(&meta)) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn file_owner(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    meta.uid()
+}
+
+#[cfg(unix)]
+fn supervisor_owner_is_trusted(owner: u32) -> bool {
+    let current = rustix::process::getuid().as_raw();
+    owner == current || owner == 0
+}
+
+#[cfg(test)]
+fn stage_supervisor_for_harness() {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    let dest = dir.join("bash-supervisor");
+    if accepted_supervisor(&dest).is_some() {
+        return;
+    }
+    let Some(src_dir) = dir.parent() else {
+        return;
+    };
+    let src = src_dir.join("bash-supervisor");
+    if accepted_supervisor(&src).is_none() {
+        return;
+    }
+    if std::fs::hard_link(&src, &dest).is_err() {
+        let _ = accepted_supervisor(&dest);
+    }
 }
 
 fn command_in_pid_namespace(command: &Command) -> Command {
@@ -503,12 +597,13 @@ fn command_in_pid_namespace(command: &Command) -> Command {
     supervised
 }
 
-fn command_in_subreaper(command: &Command) -> io::Result<Command> {
+fn command_in_subreaper(command: &Command, timeout_ms: u64) -> io::Result<Command> {
     let program = supervisor_program().ok_or_else(|| {
         io::Error::other("bash supervisor is unavailable; cannot contain detached child processes")
     })?;
     let line = command_line(command);
     let mut supervised = command_with_context(&program, command);
+    supervised.arg(timeout_ms.to_string());
     supervised.arg(line);
     Ok(supervised)
 }
@@ -549,193 +644,101 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
-fn wait_for_child(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        if started.elapsed() >= timeout {
-            terminate_child_tree(child, false);
-            return Ok(None);
-        }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        thread::sleep(Duration::from_millis(10).min(remaining));
-    }
-}
-
-/// Waits until `child` and every live member of its process group have exited,
-/// or until `timeout` elapses. Zombies are not members: a finished child that
-/// has not been reaped yet must not turn a completed command into a timeout.
-/// `Some` is the shell status after the group is empty. `None` means the
-/// deadline fired and the group was killed.
-fn wait_for_process_group(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
-    let started = Instant::now();
-    let group_id = child.id();
-    let mut exit_status = None;
-    loop {
-        if exit_status.is_none() {
-            exit_status = child.try_wait()?;
-        }
-        if exit_status.is_some() && !process_group_has_members(group_id) {
-            return Ok(exit_status);
-        }
-        if started.elapsed() >= timeout {
-            terminate_child_tree(child, exit_status.is_some());
-            return Ok(None);
-        }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        thread::sleep(Duration::from_millis(10).min(remaining));
-    }
-}
-
-fn terminate_child_tree(child: &mut Child, shell_reaped: bool) {
+/// One child, signaled at most once, and never after it has been reaped.
+///
+/// On Linux the signal goes through a pidfd opened at spawn, so a recycled
+/// pid cannot receive it. The subreaper tears itself down; this signal is
+/// only the backstop after [`supervision_grace`], or the pid-namespace kill
+/// of `unshare --kill-child`.
+struct TrackedChild {
+    child: Child,
     #[cfg(target_os = "linux")]
-    kill_linux_descendants(child.id());
-    terminate_process_group(child, shell_reaped);
+    pidfd: Option<std::os::fd::OwnedFd>,
+    reaped: bool,
+    signaled: bool,
+}
+
+impl TrackedChild {
+    fn spawn(mut command: Command) -> io::Result<Self> {
+        let child = command.spawn()?;
+        #[cfg(target_os = "linux")]
+        let pidfd = open_pidfd(child.id());
+        Ok(Self {
+            child,
+            #[cfg(target_os = "linux")]
+            pidfd,
+            reaped: false,
+            signaled: false,
+        })
+    }
+
+    fn wait_until(
+        &mut self,
+        command_deadline: Instant,
+        grace: Duration,
+    ) -> io::Result<Option<ExitStatus>> {
+        let kill_at = command_deadline
+            .checked_add(grace)
+            .unwrap_or(command_deadline);
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                return Ok(Some(status));
+            }
+            let now = Instant::now();
+            if now >= kill_at {
+                self.signal_once();
+                let reap_until = now + Duration::from_millis(200);
+                while Instant::now() < reap_until {
+                    if let Some(status) = self.child.try_wait()? {
+                        self.reaped = true;
+                        return Ok(Some(status));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10).min(kill_at.saturating_duration_since(now)));
+        }
+    }
+
+    fn signal_once(&mut self) {
+        if self.signaled || self.reaped {
+            return;
+        }
+        self.signaled = true;
+        #[cfg(target_os = "linux")]
+        if let Some(pidfd) = &self.pidfd {
+            let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = pid_from_raw(self.child.id()) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn kill_linux_descendants(root: u32) {
-    for _ in 0..2 {
-        let pids = descendant_pids(root);
-        if pids.is_empty() {
-            break;
-        }
-        for pid in pids {
-            signal_kill(pid);
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn descendant_pids(root: u32) -> Vec<u32> {
-    let mut parents = HashMap::<u32, u32>::new();
-    let mut states = HashMap::<u32, String>::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let (Some(state), Some(parent)) = (process_state(&stat), parent_pid(&stat)) else {
-            continue;
-        };
-        parents.insert(pid, parent);
-        states.insert(pid, state.to_string());
-    }
-
-    let mut live = Vec::new();
-    for (pid, state) in &states {
-        if state == "Z" || *pid == root {
-            continue;
-        }
-        let mut current = *pid;
-        let mut seen = HashSet::new();
-        while seen.insert(current) {
-            let Some(parent) = parents.get(&current).copied() else {
-                break;
-            };
-            if parent == root {
-                live.push(*pid);
-                break;
-            }
-            if parent == 0 || parent == current {
-                break;
-            }
-            current = parent;
-        }
-    }
-    live
-}
-
-fn terminate_process_group(child: &mut Child, shell_reaped: bool) {
-    #[cfg(unix)]
-    signal_process_group(child.id());
-    if !shell_reaped {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+fn open_pidfd(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    let pid = pid_from_raw(pid)?;
+    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
 }
 
 #[cfg(unix)]
-fn signal_process_group(group_id: u32) {
-    let group = format!("-{group_id}");
-    signal_kill_arg(&group);
-}
-
-#[cfg(target_os = "linux")]
-fn signal_kill(pid: u32) {
-    signal_kill_arg(&pid.to_string());
-}
-
-#[cfg(unix)]
-fn signal_kill_arg(target: &str) {
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", target])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(target_os = "linux")]
-fn process_group_has_members(pgid: u32) -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        // Keep enforcing the deadline if process-group membership cannot be
-        // observed. Treating the group as empty here would return success
-        // while descendants were still running.
-        return true;
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        if stat_is_live_group_member(&stat, pgid) {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn process_group_has_members(pgid: u32) -> bool {
-    let group = format!("-{pgid}");
-    Command::new("kill")
-        .args(["-0", "--", group.as_str()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(not(unix))]
-fn process_group_has_members(_pgid: u32) -> bool {
-    false
+fn pid_from_raw(pid: u32) -> Option<rustix::process::Pid> {
+    i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
 }
 
 /// `/proc/<pid>/stat` field 5 is the process group. `comm` may contain spaces
 /// and parentheses, so fields are counted after the last `)`.
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 fn process_group_id(stat: &str) -> Option<u32> {
     let (_, after_comm) = stat.rsplit_once(')')?;
     let mut fields = after_comm.split_whitespace();
@@ -744,23 +747,15 @@ fn process_group_id(stat: &str) -> Option<u32> {
     fields.next()?.parse().ok()
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 fn process_state(stat: &str) -> Option<&str> {
     let (_, after_comm) = stat.rsplit_once(')')?;
     after_comm.split_whitespace().next()
 }
 
-#[cfg(target_os = "linux")]
-fn parent_pid(stat: &str) -> Option<u32> {
-    let (_, after_comm) = stat.rsplit_once(')')?;
-    let mut fields = after_comm.split_whitespace();
-    let _state = fields.next()?;
-    fields.next()?.parse().ok()
-}
-
 /// A zombie still occupies its process group until something reaps it. It is
 /// not running the command.
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 fn stat_is_live_group_member(stat: &str, pgid: u32) -> bool {
     process_group_id(stat) == Some(pgid) && process_state(stat) != Some("Z")
 }
@@ -1013,7 +1008,12 @@ mod tests {
         let pid = output
             .background_task_id
             .expect("background task id should be recorded");
-        let _ = std::process::Command::new("kill").arg(&pid).status();
+        #[cfg(unix)]
+        if let Ok(raw) = pid.parse::<i32>() {
+            if let Some(pid) = rustix::process::Pid::from_raw(raw) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
 
         assert_eq!(output.stdout, "");
         assert_eq!(output.no_output_expected, Some(true));
@@ -1298,15 +1298,73 @@ os._exit(0)
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn supervisor_rejects_symlinks_world_writable_files_and_parent_directories() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(unique_token("trust"));
+        let deps = root.join("deps");
+        std::fs::create_dir_all(&deps).expect("trust dir");
+        let above = root.join("bash-supervisor");
+        write_executable(&above, "#!/bin/sh\nexit 0\n");
+        let exe = deps.join("runtime-test");
+        std::fs::write(&exe, b"exe").expect("fake exe");
+
+        assert!(
+            super::supervisor_next_to(&exe).is_none(),
+            "a supervisor above the executable must not be accepted"
+        );
+        assert!(super::accepted_supervisor(std::path::Path::new("bash-supervisor")).is_none());
+
+        let beside = deps.join("bash-supervisor");
+        std::fs::hard_link(&above, &beside).expect("hardlink beside the exe");
+        assert!(super::supervisor_next_to(&exe).is_some());
+
+        std::fs::remove_file(&beside).expect("remove hardlink");
+        symlink(&above, &beside).expect("symlink supervisor");
+        assert!(
+            super::supervisor_next_to(&exe).is_none(),
+            "a symlink must not be accepted"
+        );
+        assert!(super::accepted_supervisor(&beside).is_none());
+
+        std::fs::remove_file(&beside).expect("remove symlink");
+        write_executable(&beside, "#!/bin/sh\nexit 0\n");
+        let mut permissions = std::fs::symlink_metadata(&beside)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o666);
+        std::fs::set_permissions(&beside, permissions).expect("mode");
+        assert!(
+            super::supervisor_next_to(&exe).is_none(),
+            "a world-writable supervisor must not be accepted"
+        );
+
+        let current = rustix::process::getuid().as_raw();
+        assert!(super::supervisor_owner_is_trusted(current));
+        assert!(super::supervisor_owner_is_trusted(0));
+        let other = current.wrapping_add(1);
+        if other != 0 {
+            assert!(!super::supervisor_owner_is_trusted(other));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn process_group_fallback_refuses_to_report_success() {
         let _guard = crate::test_env_lock();
         let _mode = super::override_supervision(super::Supervision::ProcessGroup);
+        let marker = std::env::temp_dir().join(unique_token("pg-ran"));
+        let _ = std::fs::remove_file(&marker);
         let started = std::time::Instant::now();
-        let error = execute_bash(unsandboxed("printf hi", Some(1_000), false))
-            .expect_err("process group cannot contain detached children");
+        let error = execute_bash(unsandboxed(
+            &format!("touch {}", marker.display()),
+            Some(1_000),
+            false,
+        ))
+        .expect_err("process group cannot contain detached children");
 
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
+            started.elapsed() < std::time::Duration::from_millis(500),
             "returned after {:?}",
             started.elapsed()
         );
@@ -1314,36 +1372,159 @@ os._exit(0)
             error.to_string(),
             super::containment_unavailable().to_string()
         );
+        assert!(
+            !marker.exists(),
+            "process-group mode started the command before refusing"
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn process_group_fallback_bounds_a_detached_pipe_holder() {
+    fn process_group_fallback_refuses_a_detached_setsid_child() {
         let _guard = crate::test_env_lock();
         let _mode = super::override_supervision(super::Supervision::ProcessGroup);
         let token = unique_token("pg-setsid");
+        let marker = std::env::temp_dir().join(format!("{token}-ran"));
+        let _ = std::fs::remove_file(&marker);
         let started = std::time::Instant::now();
         let error = execute_bash(unsandboxed(
-            &format!("setsid sh -c 'sleep 30' {token} & echo armed"),
+            &format!(
+                "setsid sh -c 'sleep 30' {token} >/dev/null 2>&1 </dev/null & touch {} ; echo armed",
+                marker.display()
+            ),
             Some(300),
             false,
         ))
-        .expect_err("a detached child holding stdout must not hang the fallback");
+        .expect_err("a detached child must not be started without containment");
         let elapsed = started.elapsed();
-        let _cleanup = KillMatching(Some(token));
+        let _cleanup = KillMatching(Some(token.clone()));
 
         assert_eq!(
             error.to_string(),
             super::containment_unavailable().to_string()
         );
         assert!(
-            elapsed >= std::time::Duration::from_millis(200),
-            "returned after {elapsed:?}, before the reader deadline"
+            elapsed < std::time::Duration::from_millis(500),
+            "returned after {elapsed:?}; the command was started"
+        );
+        assert!(!marker.exists(), "setsid command was started");
+        assert_no_process_matching(&token);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_kills_a_child_forked_during_teardown() {
+        let _guard = crate::test_env_lock();
+        let token = unique_token("fork-teardown");
+        let started = std::time::Instant::now();
+        let output = execute_bash(unsandboxed(
+            &format!(
+                r#"python3 -c 'import os, time
+token = "{token}"
+while True:
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        os.execv("/bin/sleep", [token, "30"])
+    time.sleep(0.01)
+'"#
+            ),
+            Some(400),
+            false,
+        ))
+        .expect("forking descendant should be bounded by the timeout");
+        let elapsed = started.elapsed();
+        let mut cleanup = KillMatching(Some(token.clone()));
+
+        assert!(
+            output.interrupted,
+            "forked children survived teardown: {}",
+            output.stderr
+        );
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "timeout returned after {elapsed:?}, before the deadline"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(2),
-            "returned after {elapsed:?}; the reader join had no deadline"
+            "timeout returned after {elapsed:?}"
         );
+        assert_no_process_matching(&token);
+        cleanup.disarm();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_never_runs_kill_from_path() {
+        const CHILD: &str = "CLAWD_SUPERVISOR_KILL_CHILD";
+        const MARKER: &str = "CLAWD_SUPERVISOR_KILL_MARKER";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = std::env::temp_dir().join(unique_token("path-kill"));
+            std::fs::create_dir_all(&dir).expect("kill shadow dir");
+            let marker = dir.join("kill-ran");
+            let done = dir.join("done");
+            write_executable(
+                &dir.join("kill"),
+                "#!/bin/sh\ntouch \"$CLAWD_SUPERVISOR_KILL_MARKER\"\nexit 0\n",
+            );
+            let mut path = std::ffi::OsString::from(dir.as_os_str());
+            path.push(":");
+            if let Some(current) = std::env::var_os("PATH") {
+                path.push(current);
+            }
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test binary should be available"),
+            )
+            .args([
+                "--exact",
+                "bash::tests::cleanup_never_runs_kill_from_path",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(MARKER, &marker)
+            .env("PATH", &path)
+            .output()
+            .expect("kill shadow test should re-exec");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let ran = marker.exists();
+            let finished = done.exists();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                output.status.success() && finished && !ran,
+                "status {:?} finished {finished} kill-ran {ran}\n{stdout}\n{stderr}",
+                output.status.code()
+            );
+            return;
+        }
+
+        let _guard = crate::test_env_lock();
+        let marker = std::env::var(MARKER).expect("marker path");
+        let token = unique_token("path-kill-sleep");
+        let mut cleanup = KillMatching(Some(token.clone()));
+        let output = execute_bash(unsandboxed(
+            &format!(r#"python3 -c 'import os; os.execv("/bin/sleep", ["{token}", "30"])'"#),
+            Some(200),
+            false,
+        ))
+        .expect("timed command should return without running kill");
+        assert!(output.interrupted, "{}", output.stderr);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert!(
+            !std::path::Path::new(&marker).exists(),
+            "cleanup executed kill from PATH"
+        );
+        assert_no_process_matching(&token);
+        let done = std::path::Path::new(&marker).with_file_name("done");
+        std::fs::write(done, "ok").expect("done marker");
+        cleanup.disarm();
     }
 
     #[cfg(target_os = "linux")]
