@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -165,7 +168,8 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     let container = detect_container_environment();
     // `unshare` being on `PATH` does not mean it can create namespaces. Ubuntu
     // and nested CI hosts often reject user namespaces, and the launcher then
-    // exits before the shell runs. Probe the real flags once and fall back.
+    // exits before the shell runs. Probe the launcher once. Callers decide
+    // whether that failure can fall back or must fail closed.
     let support = namespace_support();
     let namespace_supported = support.operational;
     let network_supported = support.operational;
@@ -300,6 +304,10 @@ struct NamespaceSupport {
 
 fn namespace_support() -> NamespaceSupport {
     static SUPPORT: OnceLock<NamespaceSupport> = OnceLock::new();
+    #[cfg(test)]
+    if let Some(support) = NAMESPACE_SUPPORT_OVERRIDE.with(Cell::get) {
+        return support;
+    }
     *SUPPORT.get_or_init(|| {
         let binary_present = cfg!(target_os = "linux") && command_exists("unshare");
         NamespaceSupport {
@@ -307,6 +315,37 @@ fn namespace_support() -> NamespaceSupport {
             operational: binary_present && unshare_launcher_works(),
         }
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static NAMESPACE_SUPPORT_OVERRIDE: Cell<Option<NamespaceSupport>> = const { Cell::new(None) };
+}
+
+/// Forces the cached namespace probe for the current test thread.
+#[cfg(test)]
+#[must_use = "the probe override ends when this guard is dropped"]
+pub(crate) struct NamespaceSupportOverride;
+
+#[cfg(test)]
+pub(crate) fn override_namespace_support(
+    operational: bool,
+    binary_present: bool,
+) -> NamespaceSupportOverride {
+    NAMESPACE_SUPPORT_OVERRIDE.with(|cell| {
+        cell.set(Some(NamespaceSupport {
+            binary_present,
+            operational,
+        }));
+    });
+    NamespaceSupportOverride
+}
+
+#[cfg(test)]
+impl Drop for NamespaceSupportOverride {
+    fn drop(&mut self) {
+        NAMESPACE_SUPPORT_OVERRIDE.with(|cell| cell.set(None));
+    }
 }
 
 fn unshare_launcher_works() -> bool {

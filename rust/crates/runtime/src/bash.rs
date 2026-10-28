@@ -1,6 +1,9 @@
 use std::env;
-use std::io;
-use std::process::{Command, Output, Stdio};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +67,12 @@ pub struct BashCommandOutput {
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    // A failed probe marks network isolation inactive and used to fall through
+    // to a direct shell. That runs the command on the host network. Refuse
+    // instead of dropping a boundary the caller asked for.
+    if let Some(error) = refused_network_isolation(&sandbox_status) {
+        return Err(error);
+    }
     let BashCommandInput {
         command,
         timeout,
@@ -127,55 +136,180 @@ fn execute_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // `sh -lc` forks the requested program. Killing only the shell leaves that
-    // child holding the output pipes, so the wait would run until the command
-    // finished on its own. A private process group lets the timeout signal the
-    // whole tree.
+    // `sh -lc` forks the requested program. The shell and its descendants share
+    // a process group so the timeout can signal the whole tree. Stdout and
+    // stderr are drained concurrently: a full pipe would otherwise stall the
+    // command, and waiting for those pipes only after the shell exits would
+    // drop the deadline while a descendant still holds them.
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let started = Instant::now();
     let mut child = command.spawn()?;
-    let timeout = Duration::from_millis(timeout_ms);
+    let stdout_reader = spawn_reader(child.stdout.take());
+    let stderr_reader = spawn_reader(child.stderr.take());
+    let wait_result = wait_for_process_group(&mut child, Duration::from_millis(timeout_ms));
+    if wait_result.is_err() {
+        terminate_process_group(&mut child, false);
+    }
+    let stdout = join_reader(stdout_reader);
+    let stderr = join_reader(stderr_reader);
+    let status = wait_result?;
+    let stdout = stdout?;
+    let stderr = stderr?;
 
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            return Ok(completed_output(
-                &output,
-                dangerously_disable_sandbox,
-                sandbox_status,
-            ));
-        }
-        if started.elapsed() >= timeout {
-            terminate_child(&mut child);
-            let output = child.wait_with_output()?;
-            return Ok(timed_out_output(
-                &output,
-                timeout_ms,
-                dangerously_disable_sandbox,
-                sandbox_status,
-            ));
-        }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        std::thread::sleep(Duration::from_millis(10).min(remaining));
+    match status {
+        Some(status) => Ok(completed_output(
+            &Output {
+                status,
+                stdout,
+                stderr,
+            },
+            dangerously_disable_sandbox,
+            sandbox_status,
+        )),
+        None => Ok(timed_out_output(
+            &stdout,
+            &stderr,
+            timeout_ms,
+            dangerously_disable_sandbox,
+            sandbox_status,
+        )),
     }
 }
 
-fn terminate_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    let id = child.id();
-    let _ = child.kill();
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{id}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+fn spawn_reader(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || match pipe {
+        Some(mut pipe) => {
+            let mut buffer = Vec::new();
+            pipe.read_to_end(&mut buffer)?;
+            Ok(buffer)
+        }
+        None => Ok(Vec::new()),
+    })
+}
+
+fn join_reader(handle: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other(
+            "command output reader stopped unexpectedly",
+        )),
     }
+}
+
+/// Waits until `child` and every member of its process group have exited, or
+/// until `timeout` elapses. `Some` is the shell status after the group is
+/// empty. `None` means the deadline fired and the group was killed.
+fn wait_for_process_group(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+    let started = Instant::now();
+    let group_id = child.id();
+    let mut exit_status = None;
+    loop {
+        if exit_status.is_none() {
+            exit_status = child.try_wait()?;
+        }
+        if exit_status.is_some() && !process_group_has_members(group_id) {
+            return Ok(exit_status);
+        }
+        if started.elapsed() >= timeout {
+            terminate_process_group(child, exit_status.is_some());
+            return Ok(None);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(Duration::from_millis(10).min(remaining));
+    }
+}
+
+fn terminate_process_group(child: &mut Child, shell_reaped: bool) {
+    #[cfg(unix)]
+    signal_process_group(child.id());
+    if !shell_reaped {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(group_id: u32) {
+    let group = format!("-{group_id}");
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", group.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_has_members(pgid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        // Keep enforcing the deadline if process-group membership cannot be
+        // observed. Treating the group as empty here would return success
+        // while descendants were still running.
+        return true;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if process_group_id(&stat) == Some(pgid) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_group_has_members(pgid: u32) -> bool {
+    let group = format!("-{pgid}");
+    Command::new("kill")
+        .args(["-0", "--", group.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn process_group_has_members(_pgid: u32) -> bool {
+    false
+}
+
+/// `/proc/<pid>/stat` field 5 is the process group. `comm` may contain spaces
+/// and parentheses, so fields are counted after the last `)`.
+#[cfg(any(test, target_os = "linux"))]
+fn process_group_id(stat: &str) -> Option<u32> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    let _ppid = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+fn refused_network_isolation(status: &SandboxStatus) -> Option<io::Error> {
+    if !status.enabled || !status.requested.network_isolation || status.network_active {
+        return None;
+    }
+    let fallback = status
+        .fallback_reason
+        .as_deref()
+        .unwrap_or("network isolation unavailable");
+    let detail = fallback
+        .split("; ")
+        .find(|part| part.contains("network isolation"))
+        .unwrap_or(fallback);
+    Some(io::Error::other(format!(
+        "{detail}; refusing to run the command without network isolation"
+    )))
 }
 
 fn completed_output(
@@ -214,13 +348,14 @@ fn completed_output(
 }
 
 fn timed_out_output(
-    output: &Output,
+    stdout: &[u8],
+    stderr: &[u8],
     timeout_ms: u64,
     dangerously_disable_sandbox: Option<bool>,
     sandbox_status: SandboxStatus,
 ) -> BashCommandOutput {
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let captured_stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(stdout).into_owned();
+    let captured_stderr = String::from_utf8_lossy(stderr);
     let stderr = if captured_stderr.trim().is_empty() {
         format!("Command exceeded timeout of {timeout_ms} ms")
     } else {
@@ -414,5 +549,238 @@ mod tests {
         assert_eq!(output.no_output_expected, Some(true));
         assert!(!output.interrupted);
         assert!(output.sandbox_status.is_some());
+    }
+
+    #[test]
+    fn parses_process_group_id_after_comm_with_spaces() {
+        assert_eq!(
+            super::process_group_id("1249 (sh) S 298 1249 1249 0"),
+            Some(1249)
+        );
+        assert_eq!(super::process_group_id("12 (my proc) S 1 99 12"), Some(99));
+        assert_eq!(super::process_group_id("not a stat line"), None);
+    }
+
+    #[test]
+    fn timed_command_drains_stdout_and_stderr_together() {
+        let _guard = crate::test_env_lock();
+        // Each iteration writes a full pipe buffer to stdout and then stderr.
+        // A reader that ignores either stream lets that write block, the
+        // interpreter never exits, and the deadline fires.
+        let output = execute_bash(unsandboxed(
+            r#"python3 -c 'import sys
+chunk = 65536
+data_out = b"o" * chunk
+data_err = b"e" * chunk
+for _ in range(6):
+    sys.stdout.buffer.write(data_out)
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.write(data_err)
+    sys.stderr.buffer.flush()
+'"#,
+            Some(5_000),
+            false,
+        ))
+        .expect("large command should finish within the timeout");
+
+        assert!(
+            !output.interrupted,
+            "full pipes should be drained, got stderr {}",
+            output.stderr
+        );
+        assert_eq!(output.stdout.len(), 6 * 65_536);
+        assert_eq!(output.stderr.len(), 6 * 65_536);
+        assert!(output.stdout.bytes().all(|byte| byte == b'o'));
+        assert!(output.stderr.bytes().all(|byte| byte == b'e'));
+    }
+
+    #[test]
+    fn timeout_covers_descendants_after_the_shell_exits() {
+        let _guard = crate::test_env_lock();
+        let started = std::time::Instant::now();
+        let output = execute_bash(unsandboxed(
+            "sleep 5 >/dev/null 2>&1 & echo $!",
+            Some(300),
+            false,
+        ))
+        .expect("descendant timeout should return");
+        let elapsed = started.elapsed();
+        let pid = background_pid(&output.stdout);
+        let mut cleanup = KillOnDrop(Some(pid));
+
+        assert!(
+            output.interrupted,
+            "descendant was still running after the shell exited"
+        );
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "timeout returned after {elapsed:?}, before the deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout returned after {elapsed:?}; the shell exit ended the wait"
+        );
+        assert_pid_gone(pid);
+        cleanup.disarm();
+    }
+
+    #[test]
+    fn timeout_still_bounds_a_descendant_holding_the_output_pipes() {
+        let _guard = crate::test_env_lock();
+        let started = std::time::Instant::now();
+        let output = execute_bash(unsandboxed("sleep 5 & echo $!", Some(300), false))
+            .expect("piped descendant should not block past the timeout");
+        let elapsed = started.elapsed();
+        let pid = background_pid(&output.stdout);
+        let mut cleanup = KillOnDrop(Some(pid));
+
+        assert!(output.interrupted);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "waited {elapsed:?} for a descendant that kept stdout open"
+        );
+        assert_pid_gone(pid);
+        cleanup.disarm();
+    }
+
+    #[test]
+    fn descendant_that_exits_before_the_deadline_is_not_a_timeout() {
+        let _guard = crate::test_env_lock();
+        let started = std::time::Instant::now();
+        let output = execute_bash(unsandboxed("sleep 0.4 & echo ready", Some(2_000), false))
+            .expect("short descendant should finish");
+        let elapsed = started.elapsed();
+
+        assert!(!output.interrupted, "{}", output.stderr);
+        assert!(output.stdout.contains("ready"));
+        assert_eq!(output.return_code_interpretation, None);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "returned after {elapsed:?}, without waiting for the descendant"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "returned after {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn failed_sandbox_probe_refuses_requested_network_isolation() {
+        let _guard = crate::test_env_lock();
+        let _probe = crate::sandbox::override_namespace_support(false, true);
+        let marker = std::env::temp_dir().join(format!(
+            "claw-net-refuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let error = execute_bash(BashCommandInput {
+            command: format!("touch {}", marker.display()),
+            timeout: Some(1_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(true),
+            isolate_network: Some(true),
+            filesystem_mode: Some(FilesystemIsolationMode::Off),
+            allowed_mounts: None,
+        })
+        .expect_err("requested network isolation must fail closed");
+        let ran = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+
+        assert_eq!(
+            error.to_string(),
+            "network isolation unavailable (`unshare` cannot create a user, mount, and pid namespace); refusing to run the command without network isolation"
+        );
+        assert!(!ran, "command ran without network isolation");
+    }
+
+    #[test]
+    fn failed_sandbox_probe_still_runs_when_network_isolation_is_off() {
+        let _guard = crate::test_env_lock();
+        let _probe = crate::sandbox::override_namespace_support(false, true);
+        let output = execute_bash(BashCommandInput {
+            command: String::from("printf 'hello'"),
+            timeout: Some(1_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(true),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::Off),
+            allowed_mounts: None,
+        })
+        .expect("namespace fallback should still run the command");
+
+        assert_eq!(output.stdout, "hello");
+        let status = output.sandbox_status.expect("sandbox status");
+        assert!(!status.network_active);
+        assert!(!status.active);
+    }
+
+    fn background_pid(stdout: &str) -> u32 {
+        stdout
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.parse().ok())
+            .expect("background pid")
+    }
+
+    fn assert_pid_gone(pid: u32) {
+        #[cfg(target_os = "linux")]
+        {
+            for _ in 0..50 {
+                if !linux_pid_is_alive(pid) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("descendant {pid} was still running after the timeout");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_pid_is_alive(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // `Z` is a zombie waiting to be reaped. The timeout already killed it.
+        let Some((_, after_comm)) = stat.rsplit_once(')') else {
+            return true;
+        };
+        after_comm.split_whitespace().next() != Some("Z")
+    }
+
+    struct KillOnDrop(Option<u32>);
+
+    impl KillOnDrop {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
     }
 }
