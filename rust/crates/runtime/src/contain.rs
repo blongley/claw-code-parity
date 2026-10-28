@@ -948,8 +948,8 @@ fn enter_init(image: &ExecImage) -> ! {
     }
 }
 
-/// How init drops inherited descriptors. `Walk` is the `close_range` fallback
-/// and the test double for kernels that return `ENOSYS`.
+/// How init drops inherited descriptors. `Walk` skips `close_range` and reads
+/// `/proc/self/fd`, which is also the `ENOSYS` fallback.
 #[derive(Clone, Copy)]
 enum CloseFds {
     Range,
@@ -983,17 +983,18 @@ fn retain_allowlisted_fds(control: i32, stdout: i32, stderr: i32, close_fds: Clo
 }
 
 /// `close_range` arrived in Linux 5.9. Older kernels return `ENOSYS`. The
-/// fallback walks fd numbers and does not allocate: the soft limit is a stack
-/// `rlimit`, and each `close` is a syscall.
+/// fallback lists the descriptors that are actually open. A walk up to the
+/// soft limit misses fds already open above that ceiling, and an unlimited
+/// limit would close empty slots until `i32::MAX` before parent-death is armed.
 fn close_inherited_fds(mode: CloseFds) -> bool {
     match mode {
         #[cfg(test)]
         CloseFds::Fail => false,
         #[cfg(test)]
-        CloseFds::Walk => close_fds_through_soft_limit(),
+        CloseFds::Walk => close_open_fds_above_stdio(),
         CloseFds::Range => match close_range_above_stdio() {
             RangeClose::Done => true,
-            RangeClose::Fallback => close_fds_through_soft_limit(),
+            RangeClose::Fallback => close_open_fds_above_stdio(),
             RangeClose::Failed => false,
         },
     }
@@ -1017,56 +1018,214 @@ fn range_close_from_result(rc: i32, errno: i32) -> RangeClose {
     }
 }
 
-fn close_fds_through_soft_limit() -> bool {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // Safety: `limit` is a writable `rlimit`. `RLIMIT_NOFILE` reads this
-    // process's descriptor ceiling and does not allocate.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+/// Close every open descriptor above stderr by listing `/proc/self/fd`.
+///
+/// Closing an entry can make the kernel skip later names, so each pass starts
+/// at offset 0 and the scan repeats until a pass closes nothing. The directory
+/// fd stays open until that idle pass. No heap allocation: names are parsed
+/// out of a stack buffer. Every call is a raw syscall. The libc wrappers are
+/// cancellation points, and this runs before `PR_SET_PDEATHSIG`.
+fn close_open_fds_above_stdio() -> bool {
+    let Some(dir) = raw_open_proc_fd_dir() else {
         return false;
-    }
-    let end = soft_nofile_end(limit.rlim_cur);
-    let mut fd = 3;
-    while fd < end {
-        if !close_unused(fd) {
+    };
+    let mut buf = [0_u8; 1024];
+    loop {
+        if !raw_rewind(dir) {
+            let _ = raw_close_fd(dir);
             return false;
         }
-        fd = match fd.checked_add(1) {
-            Some(next) => next,
-            None => return false,
-        };
-    }
-    true
-}
-
-/// Valid descriptors are `0..soft`. A ceiling that does not fit in `i32`
-/// stops at `i32::MAX`, which is the largest descriptor number.
-fn soft_nofile_end(rlim_cur: libc::rlim_t) -> i32 {
-    // `i32::MAX` is the largest descriptor number. A soft limit above that, or
-    // `RLIM_INFINITY`, cannot name a further fd.
-    const MAX_FD: u64 = 0x7fff_ffff;
-    if rlim_cur >= MAX_FD {
-        i32::MAX
-    } else {
-        i32::try_from(rlim_cur).unwrap_or(i32::MAX)
+        match close_one_proc_pass(dir, &mut buf) {
+            Ok(true) => {}
+            Ok(false) => return raw_close_fd(dir).is_ok(),
+            Err(()) => {
+                let _ = raw_close_fd(dir);
+                return false;
+            }
+        }
     }
 }
 
-fn close_unused(fd: i32) -> bool {
+/// `true` when `/proc/self/fd` lists a descriptor above stderr other than the
+/// directory being read. `None` when that directory cannot be read.
+#[cfg(test)]
+fn proc_has_fd_above_stdio() -> Option<bool> {
+    let dir = raw_open_proc_fd_dir()?;
+    let mut buf = [0_u8; 1024];
+    if !raw_rewind(dir) {
+        let _ = raw_close_fd(dir);
+        return None;
+    }
+    let mut found = false;
     loop {
-        // Safety: `fd` is at least 3. `EBADF` means that slot was empty.
-        // `EINTR` retries the same close. Any other error leaves the table dirty.
-        let rc = unsafe { libc::close(fd) };
-        if rc == 0 {
-            return true;
+        let read = match raw_getdents(dir, &mut buf) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(_) => {
+                let _ = raw_close_fd(dir);
+                return None;
+            }
+        };
+        let mut offset = 0;
+        while offset < read {
+            let Ok((next, fd)) = parse_dirent(&buf[..read], offset) else {
+                let _ = raw_close_fd(dir);
+                return None;
+            };
+            offset = next;
+            if fd.is_some_and(|fd| fd > 2 && fd != dir) {
+                found = true;
+            }
+        }
+    }
+    let _ = raw_close_fd(dir);
+    Some(found)
+}
+
+fn close_one_proc_pass(dir: i32, buf: &mut [u8]) -> Result<bool, ()> {
+    let mut closed_any = false;
+    loop {
+        let read = match raw_getdents(dir, buf) {
+            Ok(0) => return Ok(closed_any),
+            Ok(count) => count,
+            // The cursor can be invalidated by a close earlier in this pass.
+            // The caller restarts from offset 0.
+            Err(_) if closed_any => return Ok(true),
+            Err(_) => return Err(()),
+        };
+        let mut offset = 0;
+        while offset < read {
+            let (next, fd) = parse_dirent(&buf[..read], offset)?;
+            offset = next;
+            let Some(fd) = fd else {
+                continue;
+            };
+            if fd <= 2 || fd == dir {
+                continue;
+            }
+            raw_close_fd(fd)?;
+            closed_any = true;
+        }
+    }
+}
+
+/// `linux_dirent64`: `d_ino` and `d_off` are 8 bytes each, then `d_reclen`,
+/// `d_type`, and a NUL-terminated name. `.` and `..` are not descriptors.
+fn parse_dirent(buf: &[u8], offset: usize) -> Result<(usize, Option<i32>), ()> {
+    let header = offset.checked_add(19).ok_or(())?;
+    if header > buf.len() {
+        return Err(());
+    }
+    let reclen = usize::from(u16::from_ne_bytes([buf[offset + 16], buf[offset + 17]]));
+    let next = offset.checked_add(reclen).ok_or(())?;
+    if reclen < 19 || next > buf.len() {
+        return Err(());
+    }
+    let name = &buf[header..next];
+    let end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    Ok((next, parse_fd_name(&name[..end])))
+}
+
+fn parse_fd_name(name: &[u8]) -> Option<i32> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut value = 0_i32;
+    for &byte in name {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(i32::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn raw_open_proc_fd_dir() -> Option<i32> {
+    let path = c"/proc/self/fd";
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    loop {
+        // Safety: `path` is a NUL-terminated literal. `O_DIRECTORY` does not
+        // create a file, so the mode is unused. `SYS_openat` is not a
+        // cancellation point.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::c_long::from(libc::AT_FDCWD),
+                path.as_ptr(),
+                libc::c_long::from(flags),
+                libc::c_long::from(0_i32),
+            )
+        };
+        if rc >= 0 {
+            return i32::try_from(rc).ok();
+        }
+        if last_errno() != libc::EINTR {
+            return None;
+        }
+    }
+}
+
+fn raw_getdents(dir: i32, buf: &mut [u8]) -> Result<usize, i32> {
+    let count = libc::c_long::try_from(buf.len()).map_err(|_| libc::EINVAL)?;
+    loop {
+        // Safety: `buf` is a writable stack buffer of `count` bytes. The kernel
+        // writes whole `linux_dirent64` records and does not retain the pointer.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                libc::c_long::from(dir),
+                buf.as_mut_ptr(),
+                count,
+            )
+        };
+        if rc >= 0 {
+            return usize::try_from(rc).map_err(|_| libc::EINVAL);
         }
         let err = last_errno();
-        if err == libc::EINTR {
-            continue;
+        if err != libc::EINTR {
+            return Err(err);
         }
-        return err == libc::EBADF;
+    }
+}
+
+fn raw_rewind(dir: i32) -> bool {
+    loop {
+        // Safety: rewinding this directory fd to offset 0 restarts the scan.
+        // `SYS_lseek` is not a cancellation point.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_lseek,
+                libc::c_long::from(dir),
+                0_i64,
+                libc::c_long::from(libc::SEEK_SET),
+            )
+        };
+        if rc >= 0 {
+            return true;
+        }
+        if last_errno() != libc::EINTR {
+            return false;
+        }
+    }
+}
+
+fn raw_close_fd(fd: i32) -> Result<(), ()> {
+    // Safety: `SYS_close` drops one descriptor and is not a cancellation point.
+    // On `EINTR` the kernel may already have released it, so this does not
+    // retry: a retry could close a number that was reused. The next pass
+    // closes the number again if it is still open.
+    let rc = unsafe { libc::syscall(libc::SYS_close, libc::c_long::from(fd)) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = last_errno();
+    if err == libc::EINTR || err == libc::EBADF {
+        Ok(())
+    } else {
+        Err(())
     }
 }
 
@@ -1216,10 +1375,10 @@ fn read_full(fd: i32, buf: &mut [u8]) -> Result<(), i32> {
 #[allow(unsafe_code)]
 mod tests {
     use super::{
-        classify_reap, clone3, clone3_raw, close_fds_through_soft_limit, close_inherited_fds,
+        classify_reap, clone3, clone3_raw, close_inherited_fds, close_open_fds_above_stdio,
         dup_onto, exit_code_from_wait, exit_code_from_waitid, parent_is_original,
-        range_close_from_result, raw_exit, reap_until_empty, resolve_program_in,
-        retain_allowlisted_fds, setup_failure_detail, signal_pidfd, soft_nofile_end, write_full,
+        proc_has_fd_above_stdio, range_close_from_result, raw_exit, reap_until_empty,
+        resolve_program_in, retain_allowlisted_fds, setup_failure_detail, signal_pidfd, write_full,
         write_id_maps, CloseFds, RangeClose, Reap, EXIT_ACK, EXIT_CLOSE_FDS, EXIT_INSTALL_FDS,
         EXIT_PARENT, EXIT_PDEATHSIG,
     };
@@ -1262,12 +1421,6 @@ mod tests {
             range_close_from_result(-1, libc::EINVAL),
             RangeClose::Failed
         ));
-    }
-
-    #[test]
-    fn soft_nofile_end_stops_at_the_descriptor_ceiling() {
-        assert_eq!(soft_nofile_end(64), 64);
-        assert_eq!(soft_nofile_end(libc::RLIM_INFINITY), i32::MAX);
     }
 
     #[test]
@@ -1410,30 +1563,17 @@ mod tests {
         {
             raw_exit(4);
         }
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        let end = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0 {
-            soft_nofile_end(limit.rlim_cur)
-        } else {
-            256
-        };
-        let mut fd = 3;
-        while fd < end {
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
-                raw_exit(5);
-            }
-            fd += 1;
+        if proc_has_fd_above_stdio() != Some(false) {
+            raw_exit(5);
         }
         raw_exit(0);
     }
 
     #[test]
-    fn fd_walk_closes_descriptors_below_the_soft_limit() {
+    fn proc_scan_closes_fds_open_above_a_lowered_soft_limit() {
         let pid = clone3(0, None, None).expect("fork");
         if pid == 0 {
-            walk_under_a_lowered_limit();
+            close_fds_above_lowered_limit();
         }
         let (_, status) = rustix::process::waitpid(
             rustix::process::Pid::from_raw(pid),
@@ -1444,11 +1584,12 @@ mod tests {
         assert_eq!(
             exit_code_from_wait(status),
             0,
-            "fd walk left a descriptor open or closed past the soft limit"
+            "an fd above the lowered soft limit stayed open ({})",
+            exit_code_from_wait(status)
         );
     }
 
-    fn walk_under_a_lowered_limit() -> ! {
+    fn close_fds_above_lowered_limit() -> ! {
         unsafe {
             let mut limit = libc::rlimit {
                 rlim_cur: 0,
@@ -1457,21 +1598,115 @@ mod tests {
             if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) != 0 {
                 raw_exit(2);
             }
-            let kept = libc::fcntl(0, libc::F_DUPFD, 80);
-            let closed = libc::fcntl(0, libc::F_DUPFD, 40);
-            if kept < 80 || !(40..80).contains(&closed) {
+            let ceiling = i32::try_from(limit.rlim_cur).unwrap_or(i32::MAX);
+            if ceiling < 8 {
                 raw_exit(3);
             }
-            limit.rlim_cur = 80;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) != 0 {
+            let high = libc::fcntl(0, libc::F_DUPFD, 80.min(ceiling - 1));
+            if high < 3 {
                 raw_exit(4);
             }
-            if !close_fds_through_soft_limit() {
+            // The descriptor is already open. Lowering the soft ceiling to its
+            // number makes it illegal to open again, but it is still open.
+            let Ok(lowered) = libc::rlim_t::try_from(high) else {
+                raw_exit(5);
+            };
+            limit.rlim_cur = lowered;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) != 0 {
                 raw_exit(5);
             }
-            let closed_gone = libc::fcntl(closed, libc::F_GETFD) < 0;
-            let kept_open = libc::fcntl(kept, libc::F_GETFD) >= 0;
-            raw_exit(if closed_gone && kept_open { 0 } else { 6 });
+            if !close_open_fds_above_stdio() {
+                raw_exit(6);
+            }
+            let still_open = libc::fcntl(high, libc::F_GETFD) >= 0;
+            let stdio_open = libc::fcntl(0, libc::F_GETFD) >= 0;
+            raw_exit(if !still_open && stdio_open { 0 } else { 7 });
+        }
+    }
+
+    #[test]
+    fn proc_scan_finishes_quickly_at_an_extreme_soft_limit() {
+        let pid = clone3(0, None, None).expect("fork");
+        if pid == 0 {
+            scan_at_extreme_limit();
+        }
+        let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+            panic!("fork returned a pid that is not a process id");
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG) {
+                Ok(Some((_, status))) => {
+                    assert_eq!(
+                        exit_code_from_wait(status),
+                        0,
+                        "extreme-limit scan failed ({})",
+                        exit_code_from_wait(status)
+                    );
+                    return;
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    let _ =
+                        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty());
+                    panic!("descriptor scan was still running after 1s at the maximum soft limit");
+                }
+                Ok(None) | Err(rustix::io::Errno::INTR) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("wait: {err}"),
+            }
+        }
+    }
+
+    fn scan_at_extreme_limit() -> ! {
+        unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) != 0 {
+                raw_exit(2);
+            }
+            // An unlimited ceiling is the case that used to walk `i32::MAX`.
+            // Unprivileged processes cannot raise the hard limit, so a rejected
+            // request falls back to that hard limit, which is still far above
+            // the descriptors this process has open.
+            let mut unlimited = limit;
+            unlimited.rlim_cur = libc::RLIM_INFINITY;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const unlimited) != 0 {
+                limit.rlim_cur = limit.rlim_max;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) != 0 {
+                    raw_exit(3);
+                }
+            }
+            let high = libc::fcntl(0, libc::F_DUPFD, 3);
+            if high < 3 {
+                raw_exit(4);
+            }
+            let mut start = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            if libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut start) != 0 {
+                raw_exit(5);
+            }
+            if !close_open_fds_above_stdio() {
+                raw_exit(6);
+            }
+            let mut end = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            if libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut end) != 0 {
+                raw_exit(7);
+            }
+            let elapsed_ns =
+                (end.tv_sec - start.tv_sec) * 1_000_000_000 + (end.tv_nsec - start.tv_nsec);
+            if elapsed_ns > 200_000_000 || libc::fcntl(high, libc::F_GETFD) >= 0 {
+                raw_exit(8);
+            }
+            raw_exit(0);
         }
     }
 
