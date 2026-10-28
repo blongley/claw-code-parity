@@ -146,8 +146,8 @@ fn execute_with_timeout(
 ) -> io::Result<BashCommandOutput> {
     // Process-group tracking cannot see `setsid` children. Tests force that
     // mode to prove the command is refused before it starts. Production
-    // always uses the supervisor, which fail-closes when neither a cgroup
-    // nor a pid namespace is available.
+    // always uses the supervisor, which fail-closes when a pid namespace
+    // cannot be created.
     #[cfg(all(test, unix))]
     if supervision_override_is_process_group() {
         return Err(containment_unavailable());
@@ -315,7 +315,7 @@ fn containment_unavailable() -> io::Error {
 
 fn unavailable_error(detail: &str) -> io::Error {
     let detail = if detail.is_empty() {
-        "no cgroup or pid namespace"
+        "no pid namespace"
     } else {
         detail
     };
@@ -459,10 +459,11 @@ enum Verdict {
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct HeldContainment {
-    cgroup: Option<PathBuf>,
-    shell: Option<std::os::fd::OwnedFd>,
-    unshare: Option<std::os::fd::OwnedFd>,
+    init_pid: Option<u32>,
     init: Option<std::os::fd::OwnedFd>,
+    /// `NotFound` means the recorded pid was already gone. Any other error
+    /// means this process does not hold a pidfd for a live init.
+    init_open_error: Option<io::Error>,
 }
 
 #[cfg(target_os = "linux")]
@@ -478,11 +479,9 @@ impl Drop for SupervisionGuard<'_> {
         if self.released {
             return;
         }
-        // The supervisor died on an error path. Kill the cgroup and the
-        // namespace init before the supervisor itself.
-        let release = release_containment(&self.held);
-        if release.clear {
-            self.tracked.signal_once();
+        let release = self.shutdown();
+        if !release.detail.is_empty() {
+            eprintln!("bash containment cleanup: {}", release.detail);
         }
     }
 }
@@ -506,46 +505,42 @@ fn watch_supervisor(
     }
     absorb_status(&mut guard.held, status_path);
     let text = std::fs::read_to_string(status_path).unwrap_or_default();
-    let release = release_containment(&guard.held);
+    let release = guard.shutdown();
     guard.released = true;
     let notes = join_notes(
         &crate::supervisor::parse_cleanup_notes(&text),
         &release.detail,
     );
-    if !release.clear {
-        return Ok((
-            Verdict::Reported(crate::supervisor::SupervisorOutcome::Unkillable {
-                detail: notes.clone(),
-            }),
-            notes,
-        ));
+    let outcome = crate::supervisor::parse_supervisor_result(&text);
+    match crate::supervisor::finalize_exit(
+        outcome,
+        release.recorded,
+        release.clear,
+        &release.detail,
+    ) {
+        Ok(outcome) => Ok((Verdict::Reported(outcome), notes)),
+        Err(()) => Err(io::Error::other(format!(
+            "supervisor ended without a containment status ({text})"
+        ))),
     }
-    crate::supervisor::parse_supervisor_result(&text).map_or_else(
-        || {
-            Err(io::Error::other(format!(
-                "supervisor ended without a containment status ({text})"
-            )))
-        },
-        |outcome| Ok((Verdict::Reported(outcome), notes)),
-    )
 }
 
 #[cfg(target_os = "linux")]
 fn intervene(guard: &mut SupervisionGuard<'_>) -> (Verdict, String) {
-    let release = release_containment(&guard.held);
-    if release.clear {
-        guard.tracked.signal_once();
-        guard.tracked.reap_for(Duration::from_millis(200));
-        guard.released = true;
+    let release = guard.shutdown();
+    guard.tracked.reap_for(Duration::from_millis(200));
+    guard.released = true;
+    if release.recorded && release.clear {
         (Verdict::BackstopTimeout, release.detail)
     } else {
-        // Leave `released` false so Drop does not kill the supervisor while
-        // a process it could not reap is still alive. Drop is idempotent on
-        // the cgroup once `shutdown_cgroup` has removed it.
-        let detail = release.detail.clone();
+        let detail = if release.detail.is_empty() {
+            crate::supervisor::INIT_NOT_TRACKED.to_string()
+        } else {
+            release.detail
+        };
         (
             Verdict::BackstopUnkillable {
-                detail: release.detail,
+                detail: detail.clone(),
             },
             detail,
         )
@@ -554,77 +549,78 @@ fn intervene(guard: &mut SupervisionGuard<'_>) -> (Verdict, String) {
 
 #[cfg(target_os = "linux")]
 struct ContainmentRelease {
+    recorded: bool,
     clear: bool,
     detail: String,
 }
 
 #[cfg(target_os = "linux")]
+impl SupervisionGuard<'_> {
+    fn shutdown(&mut self) -> ContainmentRelease {
+        let mut release = release_containment(&self.held);
+        if let Err(err) = self.tracked.signal_once() {
+            release.detail = join_notes(&release.detail, &err);
+        }
+        release
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn release_containment(held: &HeldContainment) -> ContainmentRelease {
-    let mut details = Vec::new();
-    let mut clear = true;
-    if let Some(dir) = &held.cgroup {
-        let cleanup = crate::supervisor::shutdown_cgroup(dir);
-        if !cleanup.empty {
-            clear = false;
-        }
-        if !cleanup.detail.is_empty() {
-            details.push(cleanup.detail);
-        }
-    }
+    let Some(pid) = held.init_pid else {
+        return ContainmentRelease {
+            recorded: false,
+            clear: false,
+            detail: String::new(),
+        };
+    };
     if let Some(pidfd) = &held.init {
-        if let Err(detail) = crate::supervisor::ensure_pidfd_dead(pidfd, Duration::from_secs(2)) {
-            clear = false;
-            details.push(detail);
-        }
+        return match crate::supervisor::ensure_pidfd_dead(pidfd, crate::supervisor::EMPTY_WAIT) {
+            Ok(()) => ContainmentRelease {
+                recorded: true,
+                clear: true,
+                detail: String::new(),
+            },
+            Err(detail) => ContainmentRelease {
+                recorded: true,
+                clear: false,
+                detail,
+            },
+        };
     }
-    if let Some(pidfd) = &held.shell {
-        if let Err(detail) = crate::supervisor::ensure_pidfd_dead(pidfd, Duration::from_secs(2)) {
-            clear = false;
-            details.push(detail);
-        }
-    }
-    if held.init.is_none() {
-        if let Some(pidfd) = &held.unshare {
-            let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
-            if !crate::supervisor::pidfd_exited(pidfd, Duration::from_secs(2)) {
-                clear = false;
-                details.push("pid namespace unshare still running".to_string());
-            }
-        }
-    }
-    ContainmentRelease {
-        clear,
-        detail: details.join("; "),
+    match &held.init_open_error {
+        Some(err) if err.kind() == io::ErrorKind::NotFound => ContainmentRelease {
+            recorded: true,
+            clear: true,
+            detail: String::new(),
+        },
+        Some(err) => ContainmentRelease {
+            recorded: true,
+            clear: false,
+            detail: format!("pidfd {pid}: {err}"),
+        },
+        None => ContainmentRelease {
+            recorded: false,
+            clear: false,
+            detail: crate::supervisor::INIT_NOT_TRACKED.to_string(),
+        },
     }
 }
 
 #[cfg(target_os = "linux")]
 fn absorb_status(held: &mut HeldContainment, status_path: &Path) {
+    if held.init_pid.is_some() {
+        return;
+    }
     let text = std::fs::read_to_string(status_path).unwrap_or_default();
-    let Some(live) = crate::supervisor::parse_live_containment(&text) else {
+    let Some(pid) = crate::supervisor::parse_init_pid(&text) else {
         return;
     };
-    if held.cgroup.is_none() {
-        if let Some(dir) = live.cgroup {
-            if crate::supervisor::cgroup_dir_is_ours(&dir) {
-                held.cgroup = Some(dir);
-            }
-        }
-    }
-    if held.shell.is_none() {
-        if let Some(pid) = live.shell {
-            held.shell = crate::supervisor::open_pidfd(pid);
-        }
-    }
-    if held.unshare.is_none() {
-        if let Some(pid) = live.unshare {
-            held.unshare = crate::supervisor::open_pidfd(pid);
-        }
-    }
-    if held.init.is_none() {
-        if let Some(pid) = live.init {
-            held.init = crate::supervisor::open_pidfd(pid);
-        }
+    // Open once. A later line must not retarget the pidfd onto a reused pid.
+    held.init_pid = Some(pid);
+    match crate::supervisor::open_pidfd(pid) {
+        Ok(fd) => held.init = Some(fd),
+        Err(err) => held.init_open_error = Some(err),
     }
 }
 
@@ -716,12 +712,15 @@ fn shell_quote(arg: &str) -> String {
 
 /// One child, signaled at most once, and never after it has been reaped.
 ///
-/// The signal is the backstop after the cgroup or pid namespace is empty.
-/// Killing the supervisor earlier would let descendants escape.
+/// The signal is the backstop after the pid namespace init has been killed.
+/// Killing the supervisor earlier is safe only because init has `PDEATHSIG`,
+/// and the parent still reports a missing pidfd as unkillable.
 struct TrackedChild {
     child: Child,
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
+    #[cfg(target_os = "linux")]
+    pidfd_error: Option<String>,
     reaped: bool,
     signaled: bool,
 }
@@ -729,10 +728,14 @@ struct TrackedChild {
 impl TrackedChild {
     #[cfg(target_os = "linux")]
     fn from_child(child: Child) -> Self {
-        let pidfd = crate::supervisor::open_pidfd(child.id());
+        let (pidfd, pidfd_error) = match crate::supervisor::open_pidfd(child.id()) {
+            Ok(fd) => (Some(fd), None),
+            Err(err) => (None, Some(format!("supervisor pidfd: {err}"))),
+        };
         Self {
             child,
             pidfd,
+            pidfd_error,
             reaped: false,
             signaled: false,
         }
@@ -750,24 +753,54 @@ impl TrackedChild {
         }
     }
 
-    fn signal_once(&mut self) {
+    fn signal_once(&mut self) -> Result<(), String> {
         if self.signaled || self.reaped {
-            return;
+            return Ok(());
         }
         self.signaled = true;
         #[cfg(target_os = "linux")]
         if let Some(pidfd) = &self.pidfd {
-            let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
-            return;
+            return signal_pidfd(pidfd);
         }
         #[cfg(unix)]
-        if let Some(pid) = pid_from_raw(self.child.id()) {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        {
+            let signaled = signal_pid(self.child.id());
+            #[cfg(target_os = "linux")]
+            match (signaled, self.pidfd_error.clone()) {
+                (Ok(()), _) => Ok(()),
+                (Err(err), Some(open_error)) => Err(format!("{open_error}; {err}")),
+                (Err(err), None) => Err(err),
+            }
+            #[cfg(not(target_os = "linux"))]
+            return signaled;
         }
         #[cfg(not(unix))]
         {
-            let _ = self.child.kill();
+            self.child
+                .kill()
+                .map_err(|err| format!("supervisor kill: {err}"))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pidfd(pidfd: &std::os::fd::OwnedFd) -> Result<(), String> {
+    match rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL) {
+        Ok(()) => Ok(()),
+        Err(err) if err == rustix::io::Errno::SRCH => Ok(()),
+        Err(err) => Err(format!("supervisor kill: {err}")),
+    }
+}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32) -> Result<(), String> {
+    let Some(pid) = pid_from_raw(pid) else {
+        return Err("supervisor kill: pid is not a process id".to_string());
+    };
+    match rustix::process::kill_process(pid, rustix::process::Signal::KILL) {
+        Ok(()) => Ok(()),
+        Err(err) if err == rustix::io::Errno::SRCH => Ok(()),
+        Err(err) => Err(format!("supervisor kill: {err}")),
     }
 }
 
@@ -1550,7 +1583,7 @@ os._exit(0)
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn command_that_moves_to_the_parent_cgroup_is_killed() {
+    fn setsid_child_that_moves_to_the_parent_cgroup_is_killed() {
         let _guard = crate::test_env_lock();
         let token = unique_token("cgroup-escape");
         let marker = std::env::temp_dir().join(format!("{token}-cgroup"));
@@ -1558,76 +1591,92 @@ os._exit(0)
         let mut cleanup = KillMatching(Some(token.clone()));
         let started = std::time::Instant::now();
         let marker_path = marker.display().to_string();
-        // `exec` replaces the shell the supervisor moved into `cmd`, so the
-        // process that writes the parent `cgroup.procs` is the tracked pid.
+        // setsid plus a cgroup migration. `cgroup.procs` takes the pid in the
+        // writer's pid namespace, which is `getpid` inside the command.
+        // A parent domain with subtree controllers returns EBUSY, so the child
+        // also creates a cgroup of its own and moves there. Either way it is
+        // still in the pid namespace.
         let command = format!(
-            r#"exec python3 -c 'import os, pathlib
+            r#"python3 -c 'import os, pathlib
 token = "{token}"
 marker = pathlib.Path("{marker_path}")
-rel = ""
-for line in pathlib.Path("/proc/self/cgroup").read_text().splitlines():
-    if line.startswith("0::"):
-        rel = line[3:]
-if "/bash-supervisor-" not in rel or not rel.endswith("/cmd"):
-    marker.write_text("not-contained:" + rel)
-    raise SystemExit(3)
-marker.write_text("inside:" + rel + "\n")
-above = os.path.dirname(os.path.dirname(rel))
-procs = "/sys/fs/cgroup" + above + "/cgroup.procs"
+pid = os.fork()
+if pid != 0:
+    os._exit(0)
+os.setsid()
+def current():
+    for line in pathlib.Path("/proc/self/cgroup").read_text().splitlines():
+        if line.startswith("0::"):
+            return line[3:].strip()
+    return ""
+def migrate(path):
+    with open(path, "w") as handle:
+        handle.write(str(os.getpid()))
+original = current()
+errors = []
+landed = original
+parent = os.path.dirname(original)
 try:
-    for pid in (os.getpid(), os.getppid()):
-        with open(procs, "w") as handle:
-            handle.write(str(pid))
+    migrate("/sys/fs/cgroup" + parent + "/cgroup.procs")
+    landed = current()
 except OSError as err:
-    marker.write_text("write-failed:" + str(err))
-    raise SystemExit(4)
-left = pathlib.Path("/proc/self/cgroup").read_text().replace("\n", " ")
-marker.write_text("inside:" + rel + "\nleft:" + left + "\n")
+    errors.append("parent:" + str(err))
+if landed == original:
+    nest = "/sys/fs/cgroup" + original + "/claw-{token}"
+    try:
+        os.mkdir(nest)
+        migrate(nest + "/cgroup.procs")
+        landed = current()
+    except OSError as err:
+        errors.append("nest:" + str(err))
+if landed != original:
+    marker.write_text("moved " + landed)
+else:
+    marker.write_text("move-failed:" + ",".join(errors))
 os.execv("/bin/sleep", [token, "30"])
 '"#
         );
-        let result = execute_bash(unsandboxed(&command, Some(1_500), false));
+        let output = execute_bash(unsandboxed(&command, Some(400), false))
+            .expect("setsid child should be bounded by the pid namespace");
         let elapsed = started.elapsed();
         let recorded = std::fs::read_to_string(&marker).unwrap_or_default();
         let _ = std::fs::remove_file(&marker);
+        if let Some(landed) = recorded.strip_prefix("moved ") {
+            let nest = std::path::Path::new("/sys/fs/cgroup").join(landed.trim_start_matches('/'));
+            if nest
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(&token))
+            {
+                let _ = std::fs::remove_dir(&nest);
+            }
+        }
 
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "returned after {elapsed:?}; marker {recorded}; result {result:?}"
+            output.interrupted,
+            "setsid child survived: stdout {} stderr {} marker {recorded}",
+            output.stdout, output.stderr
+        );
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
         );
         assert!(
-            !recorded.contains("not-contained:") && !recorded.contains("write-failed:"),
-            "did not attempt to leave the cgroup: {recorded}; result {result:?}"
+            recorded.starts_with("moved ")
+                || (recorded.starts_with("move-failed:")
+                    && (recorded.contains("Permission denied")
+                        || recorded.contains("Operation not permitted")
+                        || recorded.contains("Read-only file system"))),
+            "setsid child did not migrate, and the cgroup was writable: {recorded}"
         );
         assert!(
-            recorded.contains("/bash-supervisor-") && recorded.contains("/cmd"),
-            "command did not start in the delegated cmd cgroup: {recorded}; result {result:?}"
+            elapsed >= std::time::Duration::from_millis(300),
+            "timeout returned after {elapsed:?}, before the deadline"
         );
-        if let Some(left) = recorded.split("left:").nth(1) {
-            assert!(
-                !left.contains("/bash-supervisor-"),
-                "command was still inside the supervisor domain: {recorded}"
-            );
-        }
-        match &result {
-            Ok(output) => {
-                assert!(
-                    output.interrupted
-                        || output.return_code_interpretation.as_deref() == Some("exit_code:137"),
-                    "escaped command was not killed: stdout {} stderr {} code {:?}",
-                    output.stdout,
-                    output.stderr,
-                    output.return_code_interpretation
-                );
-            }
-            Err(err) => {
-                let message = err.to_string();
-                assert!(
-                    message.contains("refusing to start") || message.contains("cannot contain"),
-                    "{message}"
-                );
-            }
-        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout returned after {elapsed:?}; marker {recorded}"
+        );
         assert_no_process_matching(&token);
         cleanup.disarm();
     }

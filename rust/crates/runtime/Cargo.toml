@@ -10,7 +10,7 @@ sha2 = "0.10"
 glob = "0.3"
 plugins = { path = "../plugins" }
 regex = "1"
-rustix = { version = "1.1.4", features = ["std", "process", "event", "fs", "runtime"] }
+rustix = { version = "1.1.4", features = ["std", "process", "event", "fs", "runtime", "thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 telemetry = { path = "../telemetry" }

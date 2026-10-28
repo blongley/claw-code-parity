@@ -157,24 +157,6 @@ pub(crate) fn spawn_trusted(
     command.spawn()
 }
 
-/// Run the shell in a new session, arm parent-death, and move it into
-/// `cgroup_procs` before exec. The path is a `CString` so the child does not
-/// allocate.
-#[allow(unsafe_code)]
-pub(crate) fn isolate_shell(command: &mut Command, cgroup_procs: &CStr) {
-    let procs = cgroup_procs.to_owned();
-    // Safety: runs after `fork` and before `exec`. Failure aborts the exec,
-    // so the command cannot start outside the cgroup or in our session.
-    unsafe {
-        command.pre_exec(move || {
-            rustix::process::setsid().map_err(io::Error::from)?;
-            arm_parent_death()?;
-            write_self_to_cgroup(&procs)?;
-            Ok(())
-        });
-    }
-}
-
 /// New session and parent-death signal. Used for the command inside a pid
 /// namespace, where killing pid 1 already tears the namespace down.
 #[allow(unsafe_code)]
@@ -188,64 +170,69 @@ pub(crate) fn setsid_child(command: &mut Command) {
     }
 }
 
-/// `SIGKILL` this process when its parent dies. Used for `unshare`, whose
-/// parent is the supervisor.
-#[allow(unsafe_code)]
-pub(crate) fn parent_death_child(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            arm_parent_death()?;
-            Ok(())
-        });
-    }
-}
-
 fn arm_parent_death() -> io::Result<()> {
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
         .map_err(io::Error::from)
 }
 
-fn write_self_to_cgroup(procs: &CStr) -> io::Result<()> {
-    let pid = rustix::process::getpid().as_raw_pid();
-    let mut buf = [0_u8; 16];
-    let length = format_pid(pid, &mut buf);
-    let fd = rustix::fs::open(procs, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
-        .map_err(io::Error::from)?;
-    write_all(&fd, &buf[..length])
-}
-
-fn write_all(fd: &OwnedFd, mut buf: &[u8]) -> io::Result<()> {
-    while !buf.is_empty() {
-        let wrote = rustix::io::write(fd, buf).map_err(io::Error::from)?;
-        if wrote == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "cgroup.procs write returned no bytes",
-            ));
-        }
-        buf = &buf[wrote..];
+/// Move this process into a new user namespace and a new pid namespace.
+///
+/// The caller stays in its original pid namespace. The next child becomes pid 1
+/// of the new one, and `SIGKILL` of that child kills every process in it.
+/// Fails closed: a mapping or `unshare` error returns before any child exists.
+#[allow(unsafe_code)]
+pub(crate) fn enter_user_and_pid_namespace() -> io::Result<()> {
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    // Safety: the flags are `CLONE_NEWUSER` and `CLONE_NEWPID`, not `CLONE_FILES`.
+    // The supervisor process has not spawned threads, so this cannot split a
+    // file-descriptor table out from under another thread.
+    unsafe {
+        rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::NEWUSER)
+            .map_err(io::Error::from)?;
+    }
+    write_id_maps(uid, gid)?;
+    unsafe {
+        rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::NEWPID)
+            .map_err(io::Error::from)?;
     }
     Ok(())
 }
 
-fn format_pid(pid: i32, buf: &mut [u8; 16]) -> usize {
-    let mut value = pid.unsigned_abs();
-    let mut digits = [0_u8; 16];
-    let mut count = 0;
-    if value == 0 {
-        digits[0] = b'0';
-        count = 1;
-    } else {
-        while value > 0 {
-            digits[count] = b'0' + u8::try_from(value % 10).unwrap_or(0);
-            value /= 10;
-            count += 1;
-        }
+fn write_id_maps(uid: u32, gid: u32) -> io::Result<()> {
+    std::fs::write("/proc/self/setgroups", b"deny\n")
+        .map_err(|err| io::Error::other(format!("setgroups: {err}")))?;
+    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
+        .map_err(|err| io::Error::other(format!("uid_map: {err}")))?;
+    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
+        .map_err(|err| io::Error::other(format!("gid_map: {err}")))?;
+    Ok(())
+}
+
+pub(crate) enum ForkResult {
+    Parent(u32),
+    Child,
+}
+
+/// Fork the supervisor. The supervisor is single-threaded here: it is a fresh
+/// exec and has not spawned threads. The child must `process::exit` and must
+/// not return into the parent's frames.
+#[allow(unsafe_code)]
+pub(crate) fn fork_process() -> io::Result<ForkResult> {
+    // `fork` is the libc entry the process is already linked against. rustix
+    // has no fork wrapper. Safety: one thread, and the child exits instead of
+    // unwinding through the parent's destructors.
+    extern "C" {
+        fn fork() -> i32;
     }
-    for (slot, digit) in buf.iter_mut().zip(digits[..count].iter().rev()) {
-        *slot = *digit;
+    let pid = unsafe { fork() };
+    match pid {
+        -1 => Err(io::Error::last_os_error()),
+        0 => Ok(ForkResult::Child),
+        raw => u32::try_from(raw)
+            .map(ForkResult::Parent)
+            .map_err(|_| io::Error::other("fork returned a pid that does not fit in a u32")),
     }
-    count
 }
 
 fn cstring_from_os(value: &OsStr) -> io::Result<CString> {

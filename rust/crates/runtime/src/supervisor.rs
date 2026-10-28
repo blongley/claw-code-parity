@@ -1,37 +1,39 @@
-//! Contain one timed shell command, then tear it down.
+//! Contain one timed shell command in a pid namespace, then tear it down.
 //!
-//! The supervisor is its own session. It starts the command in a cgroup v2
-//! domain created before exec (`<domain>/cmd`, with an empty `<domain>/supervisor`
-//! sibling). Emptiness is `cgroup.events` `populated 0`, watched with `poll`.
-//! Teardown repeats `cgroup.kill` until that field is 0, then removes the
-//! directory. A process that has moved to an ancestor is killed by pidfd; if
-//! it is still alive after the wait the result is `unkillable`, never exit 127.
+//! The supervisor is its own session. It creates a user and pid namespace with
+//! `unshare` in this process, forks, and opens the child's pidfd before the
+//! child is allowed to exec the command. The child is pid 1 of that namespace.
+//! Timeout and teardown send `SIGKILL` through the pidfd and wait on it. The
+//! kernel then kills every process in the namespace. `setsid` and a move into
+//! another cgroup cannot leave it.
 //!
-//! When the domain cannot be created or the command cannot join it, the
-//! command runs in a pid namespace. Teardown kills that namespace's init and
-//! waits until the init pidfd reports the process is gone.
+//! If the pidfd was never opened, the result is `unkillable`. A normal exit is
+//! not proof that the namespace is gone. If the namespace cannot be created,
+//! the command is not started.
 
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::process::WaitOptions;
 
-/// How long teardown waits for the cgroup or pid namespace to become empty.
-const EMPTY_WAIT: Duration = Duration::from_secs(2);
+/// How long teardown waits for the namespace init to exit.
+pub(crate) const EMPTY_WAIT: Duration = Duration::from_secs(2);
 
 /// Status text for a process that survived teardown. Not an exit code.
 pub(crate) const UNKILLABLE_STATUS: &str = "processes could not be killed";
 
-const CGROUP_PREFIX: &str = "bash-supervisor-";
+/// Detail used when teardown has no pidfd to signal.
+pub(crate) const INIT_NOT_TRACKED: &str = "pid namespace init was not tracked";
 
+const RELEASED: u8 = 1;
+
+#[derive(Debug)]
 pub(crate) enum SupervisorOutcome {
     Finished(i32),
     Timeout,
@@ -40,109 +42,123 @@ pub(crate) enum SupervisorOutcome {
     Failed(String),
 }
 
-/// What the parent has learned from the status file so far.
-///
-/// A failed cgroup join falls back to a pid namespace, so both may be set.
-/// The parent kills the cgroup and the namespace init if the supervisor exits.
-#[derive(Debug, Default)]
-pub(crate) struct LiveContainment {
-    pub cgroup: Option<PathBuf>,
-    pub shell: Option<u32>,
-    pub unshare: Option<u32>,
-    pub init: Option<u32>,
+pub(crate) enum LaunchError {
+    Unavailable(io::Error),
+    Run(io::Error),
 }
 
-pub(crate) struct CgroupCleanup {
-    pub empty: bool,
-    pub detail: String,
+/// Run `command` only after `setup` succeeds. A namespace error never starts it.
+pub(crate) fn launch_contained<T>(
+    setup: Result<T, io::Error>,
+    command: impl FnOnce(T) -> io::Result<()>,
+) -> Result<(), LaunchError> {
+    match setup {
+        Ok(ready) => command(ready).map_err(LaunchError::Run),
+        Err(err) => Err(LaunchError::Unavailable(err)),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ExitDecision {
+    Report(SupervisorOutcome),
+    MissingStatus,
+}
+
+/// A missing init pidfd is `unkillable`, including when a wrapper exit is 0.
+/// Setup failures stay `unavailable` so the parent can refuse without claiming
+/// a process survived.
+pub(crate) fn decide_exit(outcome: Option<SupervisorOutcome>, init_recorded: bool) -> ExitDecision {
+    if !init_recorded {
+        return ExitDecision::Report(match outcome {
+            Some(SupervisorOutcome::Unavailable { detail }) => {
+                SupervisorOutcome::Unavailable { detail }
+            }
+            Some(SupervisorOutcome::Failed(message)) => SupervisorOutcome::Failed(message),
+            Some(SupervisorOutcome::Unkillable { detail }) => {
+                SupervisorOutcome::Unkillable { detail }
+            }
+            Some(SupervisorOutcome::Finished(_) | SupervisorOutcome::Timeout) | None => {
+                SupervisorOutcome::Unkillable {
+                    detail: INIT_NOT_TRACKED.to_string(),
+                }
+            }
+        });
+    }
+    match outcome {
+        Some(outcome) => ExitDecision::Report(outcome),
+        None => ExitDecision::MissingStatus,
+    }
+}
+
+/// Apply the pidfd wait to a parsed status. `init_dead` is false when the
+/// kill or the wait failed, or when no pidfd was held.
+pub(crate) fn finalize_exit(
+    outcome: Option<SupervisorOutcome>,
+    init_recorded: bool,
+    init_dead: bool,
+    release_detail: &str,
+) -> Result<SupervisorOutcome, ()> {
+    match decide_exit(outcome, init_recorded) {
+        ExitDecision::MissingStatus => Err(()),
+        ExitDecision::Report(SupervisorOutcome::Unavailable { detail }) => {
+            Ok(SupervisorOutcome::Unavailable { detail })
+        }
+        ExitDecision::Report(SupervisorOutcome::Failed(message)) => {
+            Ok(SupervisorOutcome::Failed(message))
+        }
+        ExitDecision::Report(SupervisorOutcome::Unkillable { detail }) => {
+            Ok(SupervisorOutcome::Unkillable {
+                detail: join_detail(&detail, release_detail),
+            })
+        }
+        ExitDecision::Report(_) if !init_dead => Ok(SupervisorOutcome::Unkillable {
+            detail: if release_detail.is_empty() {
+                "pid namespace init still running".to_string()
+            } else {
+                release_detail.to_string()
+            },
+        }),
+        ExitDecision::Report(other) => Ok(other),
+    }
 }
 
 pub(crate) fn bash_supervisor_main() -> i32 {
     match supervise() {
         Ok(()) => 0,
-        Err(_) => 1,
+        Err(err) => {
+            eprintln!("bash supervisor: {err}");
+            1
+        }
     }
 }
 
 fn supervise() -> io::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.first().is_some_and(|arg| arg == "--pid1") {
-        let status = args
-            .get(1)
-            .ok_or_else(|| io::Error::other("pid namespace supervisor requires a status file"))?;
-        let command = args
-            .get(2)
-            .ok_or_else(|| io::Error::other("pid namespace supervisor requires a command"))?;
-        return run_pid1(Path::new(status), command);
-    }
-
     let (status_path, timeout_ms, command) = parse_outer(&args)?;
     let mut status = StatusFile::open(&status_path)?;
     match prepare_session() {
         SessionStart::Ready => {}
         SessionStart::ParentExited => {
-            status.line("mode none")?;
             status.line("result unavailable parent exited before the supervisor started")?;
             return Ok(());
         }
         SessionStart::Failed(err) => {
-            status.line("mode none")?;
             status.line(&format!("result error {}", one_line(&err)))?;
             return Ok(());
         }
     }
 
     let deadline = Instant::now() + duration_from_millis(timeout_ms);
-    match ShellCgroup::create() {
-        Ok(cgroup) => {
-            status.line(&format!("mode cgroup {}", cgroup.domain.display()))?;
-            match spawn_shell(&command, &cgroup) {
-                Ok(shell) => {
-                    status.line(&format!("shell {}", shell.id()))?;
-                    supervise_cgroup(&mut status, &cgroup, shell, deadline)
-                }
-                Err(err) => {
-                    // Join failed before exec, so the command has not started.
-                    fallback_pid_namespace(
-                        &mut status,
-                        &status_path,
-                        &command,
-                        deadline,
-                        &one_line(&err),
-                    )
-                }
-            }
-        }
-        Err(cgroup_err) => fallback_pid_namespace(
-            &mut status,
-            &status_path,
-            &command,
-            deadline,
-            &one_line(&cgroup_err),
-        ),
-    }
-}
-
-fn fallback_pid_namespace(
-    status: &mut StatusFile,
-    status_path: &Path,
-    command: &str,
-    deadline: Instant,
-    cgroup_error: &str,
-) -> io::Result<()> {
-    match spawn_pid_namespace(status_path, command) {
-        Ok(unshare) => {
-            status.line(&format!("mode pidns {}", unshare.id()))?;
-            supervise_pid_namespace(status, unshare, status_path, deadline, cgroup_error)
-        }
-        Err(pidns_err) => {
-            status.line("mode none")?;
-            status.line(&format!(
-                "result unavailable cgroup: {cgroup_error}; pidns: {}",
-                one_line(&pidns_err)
-            ))?;
+    let started = launch_contained(crate::contain::enter_user_and_pid_namespace(), |()| {
+        run_in_namespace(&mut status, &status_path, &command, deadline)
+    });
+    match started {
+        Ok(()) => Ok(()),
+        Err(LaunchError::Unavailable(err)) => {
+            status.line(&format!("result unavailable {}", one_line(&err)))?;
             Ok(())
         }
+        Err(LaunchError::Run(err)) => Err(err),
     }
 }
 
@@ -181,219 +197,211 @@ fn prepare_session() -> SessionStart {
     SessionStart::Ready
 }
 
-fn spawn_shell(command: &str, cgroup: &ShellCgroup) -> io::Result<Child> {
-    let mut shell = Command::new("/bin/sh");
-    shell.arg("-c").arg(command).stdin(Stdio::null());
-    crate::contain::isolate_shell(&mut shell, &cgroup.cmd_procs);
-    shell.spawn()
-}
-
-fn spawn_pid_namespace(status: &Path, command: &str) -> io::Result<Child> {
-    // `/proc/self/exe` would be resolved by `unshare` and point at unshare.
-    let executable = fs::read_link("/proc/self/exe")?;
-    let mut unshare = Command::new("/usr/bin/unshare");
-    unshare
-        .args([
-            "--user",
-            "--map-root-user",
-            "--pid",
-            "--fork",
-            "--mount-proc",
-            "--kill-child",
-            "--",
-        ])
-        .arg(executable)
-        .arg("--pid1")
-        .arg(status)
-        .arg(command)
-        .stdin(Stdio::null());
-    crate::contain::parent_death_child(&mut unshare);
-    unshare.spawn()
-}
-
-fn supervise_cgroup(
+fn run_in_namespace(
     status: &mut StatusFile,
-    cgroup: &ShellCgroup,
-    mut shell: Child,
+    status_path: &Path,
+    command: &str,
     deadline: Instant,
 ) -> io::Result<()> {
-    let mut shell_status = None;
-    let shell_pidfd = open_pidfd(shell.id());
-    let mut events = File::open(cgroup.domain.join("cgroup.events"))?;
-    loop {
-        capture_shell_status(&mut shell, &mut shell_status)?;
-        if shell_status.is_none() && process_is_outside(shell.id(), &cgroup.domain) {
-            kill_shell(&mut shell, shell_pidfd.as_ref());
-            capture_shell_status(&mut shell, &mut shell_status)?;
+    let (mut reader, writer) = io::pipe()?;
+    match crate::contain::fork_process()? {
+        crate::contain::ForkResult::Child => {
+            drop(writer);
+            if let Err(err) = arm_parent_death() {
+                record_note(status_path, &format!("parent-death signal: {err}"));
+            }
+            let code = if wait_until_released(&mut reader) {
+                drop(reader);
+                command_as_init(status_path, command)
+            } else {
+                126
+            };
+            std::process::exit(code);
         }
-        let populated = read_populated(&mut events).unwrap_or(true);
-        if shell_status.is_some() && !populated {
-            let code = shell_status.unwrap_or(1);
-            status.line(&format!("result ok {code}"))?;
+        crate::contain::ForkResult::Parent(pid) => {
+            drop(reader);
+            let pidfd = match open_pidfd(pid) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    let kill_error = kill_and_reap(pid);
+                    drop(writer);
+                    let detail = match kill_error {
+                        Ok(()) => format!("pidfd: {err}"),
+                        Err(kill_error) => format!("pidfd: {err}; {kill_error}"),
+                    };
+                    status.line(&format!("result unkillable {}", one_line_str(&detail)))?;
+                    return Ok(());
+                }
+            };
+            let mut init = TrackedInit {
+                pid,
+                pidfd,
+                gate: writer,
+                status_path: status_path.to_path_buf(),
+                torn_down: false,
+                reaped: false,
+            };
+            // The pidfd is open. Record it before the child may exec.
+            status.line(&format!("init {}", init.pid))?;
+            if let Err(err) = init.release() {
+                let mut detail = format!("release: {err}");
+                if let Err(kill_error) = init.teardown() {
+                    detail.push_str("; ");
+                    detail.push_str(&kill_error);
+                }
+                status.line(&format!("result unkillable {}", one_line_str(&detail)))?;
+                return Ok(());
+            }
+            supervise_init(status, &mut init, status_path, deadline)
+        }
+    }
+}
+
+fn arm_parent_death() -> io::Result<()> {
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+        .map_err(io::Error::from)
+}
+
+fn wait_until_released(reader: &mut impl Read) -> bool {
+    let mut buf = [0_u8; 1];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(_) => return buf[0] == RELEASED,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+struct TrackedInit {
+    pid: u32,
+    pidfd: OwnedFd,
+    gate: std::io::PipeWriter,
+    status_path: PathBuf,
+    torn_down: bool,
+    reaped: bool,
+}
+
+impl TrackedInit {
+    fn release(&mut self) -> io::Result<()> {
+        self.gate.write_all(&[RELEASED])?;
+        self.gate.flush()?;
+        Ok(())
+    }
+
+    fn teardown(&mut self) -> Result<(), String> {
+        if self.torn_down {
             return Ok(());
         }
-        if Instant::now() >= deadline {
-            return finish_cgroup_timeout(
-                status,
-                cgroup,
-                &mut shell,
-                &mut shell_status,
-                shell_pidfd.as_ref(),
-            );
-        }
-        let slice = deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(30));
-        let _ = poll_fd(&events, slice);
-    }
-}
-
-fn finish_cgroup_timeout(
-    status: &mut StatusFile,
-    cgroup: &ShellCgroup,
-    shell: &mut Child,
-    shell_status: &mut Option<i32>,
-    shell_pidfd: Option<&OwnedFd>,
-) -> io::Result<()> {
-    let cleanup = kill_until_empty(&cgroup.domain, EMPTY_WAIT);
-    if shell_status.is_none() {
-        kill_shell(shell, shell_pidfd);
-        let _ = wait_for_child(shell, EMPTY_WAIT)?;
-        capture_shell_status(shell, shell_status)?;
-    }
-    let shell_alive = shell_status.is_none();
-    if cleanup.empty && !shell_alive {
-        if !cleanup.detail.is_empty() {
-            status.line(&format!("cleanup {}", one_line_str(&cleanup.detail)))?;
-        }
-        status.line("result timeout")?;
-    } else {
-        let mut detail = if cleanup.detail.is_empty() && shell_alive {
-            "shell still running".to_string()
+        let killed = ensure_pidfd_dead(&self.pidfd, EMPTY_WAIT);
+        let reaped = if self.reaped {
+            Ok(())
         } else {
-            cleanup.detail
+            reap_bounded(self.pid).map(|_| ())
         };
-        if shell_alive && cgroup.ancestors_writable {
-            if !detail.is_empty() {
-                detail.push_str("; ");
-            }
-            detail.push_str("ancestor cgroup.procs is writable");
+        self.reaped = true;
+        self.torn_down = true;
+        match (killed, reaped) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(kill_error), Ok(())) => Err(kill_error),
+            (Ok(()), Err(wait_error)) => Err(wait_error),
+            (Err(kill_error), Err(wait_error)) => Err(format!("{kill_error}; {wait_error}")),
         }
-        status.line(&format!("result unkillable {}", one_line_str(&detail)))?;
     }
-    Ok(())
 }
 
-fn supervise_pid_namespace(
+impl Drop for TrackedInit {
+    fn drop(&mut self) {
+        if let Err(err) = self.teardown() {
+            eprintln!("bash supervisor teardown: {err}");
+            record_note(&self.status_path, &err);
+        }
+    }
+}
+
+fn supervise_init(
     status: &mut StatusFile,
-    mut unshare: Child,
+    init: &mut TrackedInit,
     status_path: &Path,
     deadline: Instant,
-    cgroup_error: &str,
 ) -> io::Result<()> {
-    let mut init_pidfd = None;
-    let mut init_noted = false;
     loop {
-        if init_pidfd.is_none() {
-            if let Some(pid) = first_child_pid(unshare.id()) {
-                if !init_noted {
-                    status.line(&format!("init {pid}"))?;
-                    init_noted = true;
+        match try_reap(init.pid) {
+            Ok(Some(code)) => {
+                init.reaped = true;
+                return finish_reaped(status, init, status_path, code, false);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                if let Err(kill_error) = init.teardown() {
+                    status.line(&format!(
+                        "result unkillable {}",
+                        one_line_str(&format!("{err}; {kill_error}"))
+                    ))?;
+                } else {
+                    status.line(&format!("result unkillable {}", one_line_str(&err)))?;
                 }
-                init_pidfd = open_pidfd(pid);
+                return Ok(());
             }
         }
-        if let Some(exit) = unshare.try_wait()? {
-            return finish_pid_namespace(
-                status,
-                status_path,
-                exit_code(exit),
-                false,
-                cgroup_error,
-                init_pidfd.as_ref(),
-            );
-        }
         if Instant::now() >= deadline {
-            return kill_namespace(
-                status,
-                status_path,
-                &mut unshare,
-                cgroup_error,
-                init_pidfd.as_ref(),
-            );
+            return finish_timeout(status, init, status_path);
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn kill_namespace(
+fn finish_reaped(
     status: &mut StatusFile,
+    init: &mut TrackedInit,
     status_path: &Path,
-    unshare: &mut Child,
-    cgroup_error: &str,
-    init_pidfd: Option<&OwnedFd>,
+    code: i32,
+    timed_out: bool,
 ) -> io::Result<()> {
-    let mut opened = None;
-    if init_pidfd.is_none() {
-        if let Some(pid) = first_child_pid(unshare.id()) {
-            status.line(&format!("init {pid}"))?;
-            opened = open_pidfd(pid);
-        }
-    }
-    let pidfd = init_pidfd.or(opened.as_ref());
-    let Some(pidfd) = pidfd else {
-        if unshare.try_wait()?.is_none() {
-            let _ = unshare.kill();
-        }
-        let _ = wait_for_child(unshare, EMPTY_WAIT)?;
-        status.line("result unkillable pid namespace init was not tracked")?;
-        return Ok(());
-    };
-    let init_result = confirm_init_dead(pidfd, true);
-    if unshare.try_wait()?.is_none() {
-        let _ = unshare.kill();
-    }
-    let unshare_exit = wait_for_child(unshare, EMPTY_WAIT)?;
-    match init_result {
-        Ok(()) => {
-            let code = unshare_exit.map_or(1, exit_code);
-            finish_pid_namespace(status, status_path, code, true, cgroup_error, Some(pidfd))
-        }
-        Err(detail) => {
-            status.line(&format!("result unkillable {}", one_line_str(&detail)))?;
+    init.torn_down = true;
+    match pidfd_has_exited(&init.pidfd, EMPTY_WAIT) {
+        Err(err) => {
+            status.line(&format!("result unkillable {}", one_line_str(&err)))?;
             Ok(())
         }
+        Ok(false) => {
+            status.line("result unkillable pid namespace init still running")?;
+            Ok(())
+        }
+        Ok(true) => write_finished(status, status_path, code, timed_out),
     }
 }
 
-fn finish_pid_namespace(
+fn finish_timeout(
+    status: &mut StatusFile,
+    init: &mut TrackedInit,
+    status_path: &Path,
+) -> io::Result<()> {
+    if let Err(err) = init.teardown() {
+        status.line(&format!("result unkillable {}", one_line_str(&err)))?;
+        return Ok(());
+    }
+    write_finished(status, status_path, 1, true)
+}
+
+fn write_finished(
     status: &mut StatusFile,
     status_path: &Path,
     code: i32,
-    killed_for_timeout: bool,
-    cgroup_error: &str,
-    init_pidfd: Option<&OwnedFd>,
+    timed_out: bool,
 ) -> io::Result<()> {
-    // A normal exit still has to show that init is gone. Killing unshare is
-    // not that proof: the namespace lives until its init process is gone.
-    // `unshare` itself reaps the fork child on a normal exit, so a missing
-    // pidfd is proof only when the exit code is not a signal.
-    if let Some(pidfd) = init_pidfd {
-        if let Err(detail) = confirm_init_dead(pidfd, false) {
-            status.line(&format!("result unkillable {}", one_line_str(&detail)))?;
-            return Ok(());
-        }
-    } else if killed_for_timeout || code > 128 {
-        status.line("result unkillable pid namespace init was not tracked")?;
+    if let Some(detail) = note_with_prefix(status_path, "init-wait ") {
+        status.line(&format!("result unkillable {}", one_line_str(&detail)))?;
         return Ok(());
     }
     if !status_contains(status_path, "inner ready") {
         status.line(&format!(
-            "result unavailable pid namespace did not start the supervisor (exit {code}); cgroup: {cgroup_error}"
+            "result unavailable pid namespace did not start the command (exit {code})"
         ))?;
         return Ok(());
     }
-    if killed_for_timeout {
+    if timed_out {
         status.line("result timeout")?;
     } else {
         status.line(&format!("result ok {code}"))?;
@@ -401,80 +409,27 @@ fn finish_pid_namespace(
     Ok(())
 }
 
-/// `force` sends `SIGKILL` when init is still alive. Otherwise this only waits.
-fn confirm_init_dead(pidfd: &OwnedFd, force: bool) -> Result<(), String> {
-    if pidfd_exited(pidfd, Duration::ZERO) {
-        return Ok(());
-    }
-    if force {
-        if let Err(err) = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL) {
-            if !pidfd_exited(pidfd, Duration::ZERO) {
-                return Err(format!("pid namespace init: {err}"));
-            }
-            return Ok(());
-        }
-    }
-    if pidfd_exited(pidfd, EMPTY_WAIT) {
-        Ok(())
-    } else {
-        Err("pid namespace init still running".to_string())
-    }
-}
-
-fn wait_for_child(child: &mut Child, bound: Duration) -> io::Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + bound;
-    loop {
-        if let Some(exit) = child.try_wait()? {
-            return Ok(Some(exit));
-        }
-        if Instant::now() >= deadline {
-            return child.try_wait();
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn kill_shell(shell: &mut Child, pidfd: Option<&OwnedFd>) {
-    if let Some(pidfd) = pidfd {
-        let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
-    }
-    if let Some(pid) = pid_from_raw(shell.id()) {
-        // The shell called `setsid`, so its process-group id is its pid.
-        // A group that does not exist yet returns `ESRCH`.
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-    let _ = shell.kill();
-}
-
-fn capture_shell_status(shell: &mut Child, shell_status: &mut Option<i32>) -> io::Result<()> {
-    if shell_status.is_none() {
-        if let Some(exit) = shell.try_wait()? {
-            *shell_status = Some(exit_code(exit));
-        }
-    }
-    Ok(())
-}
-
-/// Pid 1 of a command's pid namespace. Reaps until `ECHILD`. Killing this
+/// Pid 1 of the command's pid namespace. Reaps until `ECHILD`. Killing this
 /// process kills every other process in the namespace.
-fn run_pid1(status: &Path, command: &str) -> io::Result<()> {
-    // Parent is `unshare`. If the supervisor kills `unshare`, or `unshare`
-    // dies with the supervisor, this process gets `SIGKILL`.
-    let _ = rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL));
-    let _ = rustix::process::setsid();
-    mark_pid1_ready(status)?;
+fn command_as_init(status: &Path, command: &str) -> i32 {
+    if let Err(err) = rustix::process::setsid() {
+        record_note(status, &format!("setsid: {err}"));
+    }
+    if mark_ready(status).is_err() {
+        return 126;
+    }
     let mut shell = Command::new("/bin/sh");
     shell.arg("-c").arg(command).stdin(Stdio::null());
     crate::contain::setsid_child(&mut shell);
     let Ok(child) = shell.spawn() else {
-        std::process::exit(126);
+        return 126;
     };
     let shell_pid = rustix::process::Pid::from_child(&child);
-    // `Child` does not wait or signal on drop. `wait` below is the reap.
+    // `Child` does not wait or signal on drop. The loop below is the reap.
     drop(child);
     let mut shell_status = None;
     loop {
-        match rustix::process::wait(rustix::process::WaitOptions::empty()) {
+        match rustix::process::wait(WaitOptions::empty()) {
             Ok(Some((pid, wait_status))) => {
                 if pid == shell_pid {
                     shell_status = Some(wait_status_code(wait_status));
@@ -483,17 +438,44 @@ fn run_pid1(status: &Path, command: &str) -> io::Result<()> {
             Ok(None) => thread::sleep(Duration::from_millis(10)),
             Err(rustix::io::Errno::CHILD) => break,
             Err(rustix::io::Errno::INTR) => {}
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                record_init_wait(status, &err.to_string());
+                return 126;
+            }
         }
     }
-    std::process::exit(shell_status.unwrap_or(126));
+    shell_status.unwrap_or(126)
 }
 
-fn mark_pid1_ready(status: &Path) -> io::Result<()> {
+fn mark_ready(status: &Path) -> io::Result<()> {
     let mut file = OpenOptions::new().append(true).open(status)?;
     writeln!(file, "inner ready")?;
     file.sync_all()?;
     Ok(())
+}
+
+fn record_init_wait(status: &Path, detail: &str) {
+    let line = format!("init-wait {}", one_line_str(detail));
+    match OpenOptions::new().append(true).open(status) {
+        Ok(mut file) => {
+            if let Err(err) = writeln!(file, "{line}") {
+                eprintln!("{line}; status write: {err}");
+            }
+        }
+        Err(err) => eprintln!("{line}; status open: {err}"),
+    }
+}
+
+fn record_note(status: &Path, detail: &str) {
+    let line = format!("cleanup {}", one_line_str(detail));
+    match OpenOptions::new().append(true).open(status) {
+        Ok(mut file) => {
+            if let Err(err) = writeln!(file, "{line}") {
+                eprintln!("{line}; status write: {err}");
+            }
+        }
+        Err(err) => eprintln!("{line}; status open: {err}"),
+    }
 }
 
 fn wait_status_code(status: rustix::process::WaitStatus) -> i32 {
@@ -505,13 +487,49 @@ fn wait_status_code(status: rustix::process::WaitStatus) -> i32 {
         .map_or(1, |signal| 128_i32.saturating_add(signal))
 }
 
-fn exit_code(status: ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
+fn try_reap(pid: u32) -> Result<Option<i32>, String> {
+    let Some(pid) = pid_from_raw(pid) else {
+        return Err("wait: pid is not a process id".to_string());
+    };
+    match rustix::process::waitpid(Some(pid), WaitOptions::NOHANG) {
+        Ok(Some((_, wait_status))) => Ok(Some(wait_status_code(wait_status))),
+        Ok(None) | Err(rustix::io::Errno::INTR) => Ok(None),
+        Err(rustix::io::Errno::CHILD) => {
+            Err("wait: pid namespace init was not a child".to_string())
+        }
+        Err(err) => Err(format!("wait: {err}")),
     }
-    status
-        .signal()
-        .map_or(1, |signal| 128_i32.saturating_add(signal))
+}
+
+fn reap_bounded(pid: u32) -> Result<Option<i32>, String> {
+    let deadline = Instant::now() + EMPTY_WAIT;
+    loop {
+        match try_reap(pid) {
+            Ok(Some(code)) => return Ok(Some(code)),
+            Ok(None) if Instant::now() >= deadline => {
+                return Err("wait: pid namespace init still running".to_string());
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn kill_and_reap(pid: u32) -> Result<(), String> {
+    let Some(raw) = pid_from_raw(pid) else {
+        return Err("kill: pid is not a process id".to_string());
+    };
+    let killed = match rustix::process::kill_process(raw, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(err) => Err(format!("kill: {err}")),
+    };
+    let waited = reap_bounded(pid).map(|_| ());
+    match (killed, waited) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(kill_error), Ok(())) => Err(kill_error),
+        (Ok(()), Err(wait_error)) => Err(wait_error),
+        (Err(kill_error), Err(wait_error)) => Err(format!("{kill_error}; {wait_error}")),
+    }
 }
 
 fn duration_from_millis(ms: u64) -> Duration {
@@ -528,6 +546,18 @@ fn one_line_str(text: &str) -> String {
 
 fn status_contains(path: &Path, line: &str) -> bool {
     fs::read_to_string(path).is_ok_and(|text| complete_lines(&text).any(|item| item == line))
+}
+
+fn note_with_prefix(path: &Path, prefix: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let notes = complete_lines(&text)
+        .filter_map(|line| line.strip_prefix(prefix))
+        .collect::<Vec<_>>();
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("; "))
+    }
 }
 
 struct StatusFile {
@@ -547,345 +577,51 @@ impl StatusFile {
     }
 }
 
-struct ShellCgroup {
-    domain: PathBuf,
-    cmd_procs: CString,
-    /// The command's uid can write an ancestor `cgroup.procs`, so it can leave
-    /// this domain. Escape is detected from `/proc/<pid>/cgroup`.
-    ancestors_writable: bool,
+pub(crate) fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
+    let pid = pid_from_raw(pid).ok_or_else(|| io::Error::other("pid is not a process id"))?;
+    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).map_err(io::Error::from)
 }
 
-impl ShellCgroup {
-    fn create() -> io::Result<Self> {
-        let listing = fs::read_to_string("/proc/self/cgroup")
-            .map_err(|err| io::Error::other(format!("cgroup listing: {err}")))?;
-        let relative = listing
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| io::Error::other("cgroup v2 hierarchy is not delegated"))?;
-        let parent = PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-        cleanup_leftovers(&parent);
-        let domain = parent.join(format!("{CGROUP_PREFIX}{}", std::process::id()));
-        fs::create_dir(&domain).map_err(|err| io::Error::other(format!("cgroup mkdir: {err}")))?;
-        let created = Self {
-            cmd_procs: cstring_path(&domain.join("cmd").join("cgroup.procs"))?,
-            ancestors_writable: ancestor_procs_writable(&domain),
-            domain,
-        };
-        if let Err(err) = created.make_children() {
-            let _ = kill_until_empty(&created.domain, Duration::from_millis(0));
-            return Err(err);
-        }
-        Ok(created)
-    }
-
-    fn make_children(&self) -> io::Result<()> {
-        let supervisor = self.domain.join("supervisor");
-        let cmd = self.domain.join("cmd");
-        fs::create_dir(&supervisor)
-            .map_err(|err| io::Error::other(format!("cgroup mkdir supervisor: {err}")))?;
-        if let Err(err) = fs::create_dir(&cmd) {
-            let _ = fs::remove_dir(&supervisor);
-            return Err(io::Error::other(format!("cgroup mkdir cmd: {err}")));
-        }
-        if !self.domain.join("cgroup.kill").is_file()
-            || !self.domain.join("cgroup.events").is_file()
-        {
-            return Err(io::Error::other(
-                "cgroup.kill or cgroup.events is not available",
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for ShellCgroup {
-    fn drop(&mut self) {
-        // Kill before remove. A leftover populated directory cannot be removed,
-        // and a supervisor that is unwinding must not leave the command running.
-        let _ = kill_until_empty(&self.domain, EMPTY_WAIT);
-    }
-}
-
-fn cstring_path(path: &Path) -> io::Result<CString> {
-    use std::os::unix::ffi::OsStrExt;
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::other("cgroup path contains a NUL"))
-}
-
-fn cleanup_leftovers(parent: &Path) {
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let Some(pid) = name.strip_prefix(CGROUP_PREFIX) else {
-            continue;
-        };
-        let Ok(pid) = pid.parse::<u32>() else {
-            continue;
-        };
-        // A live supervisor owns this directory. A reused pid is left alone
-        // rather than killing whatever now has that id.
-        if Path::new(&format!("/proc/{pid}")).exists() {
-            continue;
-        }
-        let _ = kill_until_empty(&entry.path(), EMPTY_WAIT);
-    }
-}
-
-fn ancestor_procs_writable(domain: &Path) -> bool {
-    let uid = rustix::process::getuid().as_raw();
-    let gid = rustix::process::getgid().as_raw();
-    let mut current = domain.parent();
-    while let Some(dir) = current {
-        if procs_writable(&dir.join("cgroup.procs"), uid, gid) {
-            return true;
-        }
-        if dir == Path::new("/sys/fs/cgroup") {
-            break;
-        }
-        current = dir.parent();
-    }
-    false
-}
-
-fn procs_writable(path: &Path, uid: u32, gid: u32) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return true;
-    };
-    let mode = meta.mode();
-    let owner_write = meta.uid() == uid && mode & 0o200 != 0;
-    let group_write = meta.gid() == gid && mode & 0o020 != 0;
-    let other_write = mode & 0o002 != 0;
-    owner_write || group_write || other_write
-}
-
-pub(crate) fn cgroup_dir_is_ours(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    if !name.starts_with(CGROUP_PREFIX) || !path.starts_with("/sys/fs/cgroup") {
-        return false;
-    }
-    path.components()
-        .all(|component| !matches!(component, std::path::Component::ParentDir))
-}
-
-/// Repeat `cgroup.kill` until `cgroup.events` says `populated 0`, then remove
-/// the domain. Write and `rmdir` failures are returned in `detail`.
-pub(crate) fn shutdown_cgroup(dir: &Path) -> CgroupCleanup {
-    kill_until_empty(dir, EMPTY_WAIT)
-}
-
-fn kill_until_empty(dir: &Path, bound: Duration) -> CgroupCleanup {
-    if !cgroup_dir_is_ours(dir) {
-        return CgroupCleanup {
-            empty: false,
-            detail: "refusing to kill a cgroup outside the supervisor prefix".to_string(),
-        };
-    }
-    let events_path = dir.join("cgroup.events");
-    let mut events = match File::open(&events_path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return CgroupCleanup {
-                empty: true,
-                detail: remove_domain(dir),
-            };
-        }
-        Err(err) => {
-            return CgroupCleanup {
-                empty: false,
-                detail: format!("cgroup.events: {err}"),
-            };
-        }
-    };
-    let deadline = Instant::now() + bound;
-    let mut kill_error = String::new();
-    loop {
-        let populated = match read_populated(&mut events) {
-            Ok(value) => value,
-            Err(err) => {
-                return CgroupCleanup {
-                    empty: false,
-                    detail: format!("cgroup.events: {err}"),
-                };
-            }
-        };
-        if !populated {
-            drop(events);
-            return CgroupCleanup {
-                empty: true,
-                detail: join_detail(&kill_error, &remove_domain(dir)),
-            };
-        }
-        if let Err(err) = fs::write(dir.join("cgroup.kill"), b"1") {
-            let message = format!("cgroup.kill: {err}");
-            if kill_error.is_empty() {
-                kill_error = message;
-            }
-        }
-        if Instant::now() >= deadline {
-            let still = read_populated(&mut events).unwrap_or(true);
-            if !still {
-                drop(events);
-                return CgroupCleanup {
-                    empty: true,
-                    detail: join_detail(&kill_error, &remove_domain(dir)),
-                };
-            }
-            let detail = if kill_error.is_empty() {
-                "cgroup still populated".to_string()
-            } else {
-                kill_error
-            };
-            return CgroupCleanup {
-                empty: false,
-                detail,
-            };
-        }
-        let slice = deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(30));
-        let _ = poll_fd(&events, slice);
-    }
-}
-
-fn remove_domain(dir: &Path) -> String {
-    let mut errors = Vec::new();
-    for name in ["cmd", "supervisor"] {
-        if let Err(err) = fs::remove_dir(dir.join(name)) {
-            if err.kind() != io::ErrorKind::NotFound {
-                errors.push(format!("rmdir {name}: {err}"));
-            }
-        }
-    }
-    if let Err(err) = fs::remove_dir(dir) {
-        if err.kind() != io::ErrorKind::NotFound {
-            errors.push(format!("rmdir {}: {err}", dir.display()));
-        }
-    }
-    errors.join("; ")
-}
-
-fn join_detail(kill_error: &str, remove_error: &str) -> String {
-    match (kill_error.is_empty(), remove_error.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => kill_error.to_string(),
-        (true, false) => remove_error.to_string(),
-        (false, false) => format!("{kill_error}; {remove_error}"),
-    }
-}
-
-fn read_populated(file: &mut File) -> io::Result<bool> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    populated_from_events(&text)
-}
-
-fn populated_from_events(text: &str) -> io::Result<bool> {
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("populated ") {
-            return Ok(value.trim() != "0");
-        }
-    }
-    Err(io::Error::other("cgroup.events has no populated field"))
-}
-
-fn poll_fd(file: &File, bound: Duration) -> io::Result<()> {
-    let deadline = Instant::now() + bound;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(());
-        }
-        let timeout = Timespec::try_from(remaining).ok();
-        let mut fds = [PollFd::new(
-            file,
-            PollFlags::PRI.union(PollFlags::IN).union(PollFlags::ERR),
-        )];
-        match rustix::event::poll(&mut fds, timeout.as_ref()) {
-            Ok(_) => return Ok(()),
-            Err(rustix::io::Errno::INTR) => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-}
-
-fn process_is_outside(pid: u32, domain: &Path) -> bool {
-    match fs::read_to_string(format!("/proc/{pid}/cgroup")) {
-        Ok(text) => {
-            let Some(relative) = text.lines().find_map(|line| line.strip_prefix("0::")) else {
-                return true;
-            };
-            !under_domain(relative.trim(), domain)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
-        Err(_) => true,
-    }
-}
-
-fn under_domain(relative: &str, domain: &Path) -> bool {
-    let Ok(suffix) = domain.strip_prefix("/sys/fs/cgroup") else {
-        return false;
-    };
-    let suffix = suffix.to_str().unwrap_or("");
-    let domain_rel = if suffix.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{suffix}")
-    };
-    relative == domain_rel || relative.starts_with(&format!("{domain_rel}/"))
-}
-
-fn first_child_pid(pid: u32) -> Option<u32> {
-    let text = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
-    text.split_whitespace().next()?.parse().ok()
-}
-
-pub(crate) fn open_pidfd(pid: u32) -> Option<OwnedFd> {
-    let pid = pid_from_raw(pid)?;
-    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
-}
-
-pub(crate) fn pidfd_exited(pidfd: &OwnedFd, bound: Duration) -> bool {
+fn pidfd_has_exited(pidfd: &OwnedFd, bound: Duration) -> Result<bool, String> {
     let deadline = Instant::now() + bound;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let timeout = Timespec::try_from(remaining).ok();
         let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
         match rustix::event::poll(&mut fds, timeout.as_ref()) {
-            Ok(0) => return false,
-            Ok(_) => return true,
-            Err(rustix::io::Errno::INTR) => {}
-            Err(_) => return false,
-        }
-        if Instant::now() >= deadline {
-            return false;
+            Ok(0) => return Ok(false),
+            Ok(_) => return Ok(true),
+            Err(rustix::io::Errno::INTR) => {
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+            }
+            Err(err) => return Err(format!("pidfd wait: {err}")),
         }
     }
 }
 
 /// Kill `pidfd` if the process is still alive and wait until it exits.
 pub(crate) fn ensure_pidfd_dead(pidfd: &OwnedFd, bound: Duration) -> Result<(), String> {
-    if pidfd_exited(pidfd, Duration::ZERO) {
-        return Ok(());
+    match pidfd_has_exited(pidfd, Duration::ZERO) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(err) => return Err(err),
     }
     if let Err(err) = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL) {
-        if pidfd_exited(pidfd, Duration::ZERO) {
-            return Ok(());
+        if err != rustix::io::Errno::SRCH {
+            return Err(format!("pidfd kill: {err}"));
         }
-        return Err(format!("pidfd kill: {err}"));
+        return match pidfd_has_exited(pidfd, Duration::ZERO) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!("pidfd kill: {err}")),
+            Err(wait_error) => Err(format!("pidfd kill: {err}; {wait_error}")),
+        };
     }
-    if pidfd_exited(pidfd, bound) {
-        Ok(())
-    } else {
-        Err("process still running after SIGKILL".to_string())
+    match pidfd_has_exited(pidfd, bound) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("process still running after SIGKILL".to_string()),
+        Err(err) => Err(err),
     }
 }
 
@@ -928,40 +664,24 @@ pub(crate) fn parse_cleanup_notes(text: &str) -> String {
         .join("; ")
 }
 
-pub(crate) fn parse_live_containment(text: &str) -> Option<LiveContainment> {
-    let mut live = LiveContainment::default();
-    let mut seen = false;
-    for line in complete_lines(text) {
-        let mut parts = line.splitn(3, ' ');
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some("mode"), Some("cgroup"), Some(path)) if path.starts_with('/') => {
-                live.cgroup = Some(PathBuf::from(path));
-                seen = true;
-            }
-            (Some("mode"), Some("pidns"), Some(pid)) => {
-                if let Ok(pid) = pid.parse() {
-                    live.unshare = Some(pid);
-                    seen = true;
-                }
-            }
-            (Some("mode"), Some("none"), _) => {
-                live = LiveContainment::default();
-                seen = false;
-            }
-            (Some("shell"), Some(pid), None) => {
-                if let Ok(pid) = pid.parse() {
-                    live.shell = Some(pid);
-                }
-            }
-            (Some("init"), Some(pid), None) => {
-                if let Ok(pid) = pid.parse() {
-                    live.init = Some(pid);
-                }
-            }
-            _ => {}
+/// The first complete `init <pid>` line. Later lines cannot replace it.
+pub(crate) fn parse_init_pid(text: &str) -> Option<u32> {
+    complete_lines(text).find_map(|line| {
+        let rest = line.strip_prefix("init ")?;
+        if rest.contains(' ') {
+            return None;
         }
+        rest.parse().ok()
+    })
+}
+
+fn join_detail(left: &str, right: &str) -> String {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => left.to_string(),
+        (true, false) => right.to_string(),
+        (false, false) => format!("{left}; {right}"),
     }
-    seen.then_some(live)
 }
 
 fn complete_lines(text: &str) -> impl Iterator<Item = &str> {
@@ -977,17 +697,17 @@ fn complete_lines(text: &str) -> impl Iterator<Item = &str> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::{
-        parse_live_containment, parse_supervisor_result, populated_from_events, LiveContainment,
-        SupervisorOutcome,
+        decide_exit, finalize_exit, launch_contained, parse_init_pid, parse_supervisor_result,
+        ExitDecision, LaunchError, SupervisorOutcome, INIT_NOT_TRACKED,
     };
 
     #[test]
     fn timeout_is_a_flag_and_exit_124_is_a_status() {
         assert!(matches!(
-            parse_supervisor_result(
-                "mode cgroup /sys/fs/cgroup/bash-supervisor-1\nresult timeout\n"
-            ),
+            parse_supervisor_result("init 4\nresult timeout\n"),
             Some(SupervisorOutcome::Timeout)
         ));
         assert!(matches!(
@@ -999,7 +719,7 @@ mod tests {
     #[test]
     fn unkillable_is_not_an_exit_code() {
         assert!(matches!(
-            parse_supervisor_result("result unkillable cgroup.kill: busy\n"),
+            parse_supervisor_result("result unkillable pidfd kill: busy\n"),
             Some(SupervisorOutcome::Unkillable { .. })
         ));
         assert!(parse_supervisor_result("result ok 127\n")
@@ -1009,33 +729,59 @@ mod tests {
     #[test]
     fn partial_trailing_line_is_ignored() {
         assert!(parse_supervisor_result("result timeout").is_none());
-        let live = parse_live_containment("mode pidns 42\ninit 43\nresult time")
-            .expect("complete pidns line");
-        assert_eq!(live.unshare, Some(42));
-        assert_eq!(live.init, Some(43));
+        assert_eq!(parse_init_pid("init 43\nresult time"), Some(43));
+        assert_eq!(parse_init_pid("init 43"), None);
+        assert_eq!(parse_init_pid("init 43\ninit 1\n"), Some(43));
     }
 
     #[test]
-    fn emptiness_is_populated_zero() {
-        assert!(!populated_from_events("populated 0\nfrozen 0\n").expect("populated 0"));
-        assert!(populated_from_events("populated 1\nfrozen 0\n").expect("populated 1"));
-        assert!(populated_from_events("frozen 0\npopulated 1\n").expect("reordered"));
-        assert!(populated_from_events("frozen 0\n").is_err());
-    }
-
-    #[test]
-    fn fallback_keeps_the_cgroup_path_and_the_namespace() {
-        let live = parse_live_containment(
-            "mode cgroup /sys/fs/cgroup/bash-supervisor-7\nmode pidns 8\nshell 9\ninit 10\n",
-        )
-        .expect("both containers");
-        assert_eq!(
-            live.cgroup.as_deref(),
-            Some(std::path::Path::new("/sys/fs/cgroup/bash-supervisor-7"))
+    fn unrecorded_init_is_unkillable_even_if_the_wrapper_exits_zero() {
+        match decide_exit(Some(SupervisorOutcome::Finished(0)), false) {
+            ExitDecision::Report(SupervisorOutcome::Unkillable { detail }) => {
+                assert_eq!(detail, INIT_NOT_TRACKED);
+            }
+            other => panic!("expected unkillable, got {other:?}"),
+        }
+        assert!(matches!(
+            decide_exit(Some(SupervisorOutcome::Timeout), false),
+            ExitDecision::Report(SupervisorOutcome::Unkillable { .. })
+        ));
+        assert!(matches!(
+            decide_exit(Some(SupervisorOutcome::Finished(0)), true),
+            ExitDecision::Report(SupervisorOutcome::Finished(0))
+        ));
+        let refused = finalize_exit(
+            Some(SupervisorOutcome::Unavailable {
+                detail: "unshare: EPERM".to_string(),
+            }),
+            false,
+            false,
+            "",
         );
-        assert_eq!(live.shell, Some(9));
-        assert_eq!(live.unshare, Some(8));
-        assert_eq!(live.init, Some(10));
-        let _ = LiveContainment::default();
+        assert!(matches!(refused, Ok(SupervisorOutcome::Unavailable { .. })));
+        let killed = finalize_exit(
+            Some(SupervisorOutcome::Finished(0)),
+            true,
+            false,
+            "pidfd kill: busy",
+        );
+        match killed {
+            Ok(SupervisorOutcome::Unkillable { detail }) => {
+                assert_eq!(detail, "pidfd kill: busy");
+            }
+            other => panic!("expected the kill error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_setup_failure_does_not_run_the_command() {
+        let mut ran = false;
+        let error = launch_contained(Err(io::Error::other("unshare: EPERM")), |()| {
+            ran = true;
+            Ok(())
+        })
+        .expect_err("a pid namespace failure must fail closed");
+        assert!(!ran, "the command ran without a pid namespace");
+        assert!(matches!(error, LaunchError::Unavailable(_)));
     }
 }
