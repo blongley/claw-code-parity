@@ -13,9 +13,9 @@
 use std::cell::Cell;
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -30,6 +30,11 @@ pub(crate) const UNKILLABLE_STATUS: &str = "processes could not be killed";
 const RELEASED: u8 = 1;
 const ARM_FAILED: i32 = 86;
 const EMPTY_WAIT: Duration = Duration::from_secs(2);
+/// Allowlisted child descriptors. `close_range(3, ~0, 0)` drops every other fd
+/// the child inherited, including another init's stdout writer.
+const FD_CONTROL: i32 = 0;
+const FD_STDOUT: i32 = 1;
+const FD_STDERR: i32 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Containment {
@@ -113,22 +118,14 @@ pub(crate) fn run_timed(
 
     let (stdout_read, stdout_write) = io::pipe()?;
     let (stderr_read, stderr_write) = io::pipe()?;
-    let (mut ack_read, ack_write) = io::pipe()?;
-    let (release_read, mut release_write) = io::pipe()?;
+    let (mut parent_control, child_control) = control_socket()?;
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
     let image = ExecImage::prepare(
         command,
         stdout_write.as_raw_fd(),
         stderr_write.as_raw_fd(),
-        ack_write.as_raw_fd(),
-        release_read.as_raw_fd(),
-        [
-            stdout_read.as_raw_fd(),
-            stderr_read.as_raw_fd(),
-            ack_read.as_raw_fd(),
-            release_write.as_raw_fd(),
-        ],
+        child_control.as_raw_fd(),
     )?;
 
     let mut pidfd_slot = -1;
@@ -150,8 +147,7 @@ pub(crate) fn run_timed(
     };
     drop(stdout_write);
     drop(stderr_write);
-    drop(ack_write);
-    drop(release_read);
+    drop(child_control);
 
     if pidfd_slot < 0 {
         let detail = match kill_live_pid(pid) {
@@ -171,15 +167,7 @@ pub(crate) fn run_timed(
     let reader_deadline = deadline + Duration::from_secs(3);
     let stdout_thread = spawn_reader(stdout_read, reader_deadline);
     let stderr_thread = spawn_reader(stderr_read, reader_deadline);
-    let outcome = supervise(
-        &mut init,
-        pid,
-        &mut ack_read,
-        &mut release_write,
-        uid,
-        gid,
-        deadline,
-    );
+    let outcome = supervise(&mut init, pid, &mut parent_control, uid, gid, deadline);
     let stdout = join_reader(stdout_thread)?;
     let stderr = join_reader(stderr_thread)?;
     Ok((
@@ -229,13 +217,12 @@ impl Drop for HeldInit {
 fn supervise(
     init: &mut HeldInit,
     pid: i32,
-    ack: &mut (impl Read + AsFd),
-    release: &mut impl io::Write,
+    control: &mut (impl Read + io::Write + AsFd),
     uid: u32,
     gid: u32,
     deadline: Instant,
 ) -> Containment {
-    match wait_for_ack(ack, &init.pidfd, deadline) {
+    match wait_for_ack(control, &init.pidfd, deadline) {
         Ack::Ready => {}
         Ack::Exited => {
             return match reap_exit(&init.pidfd) {
@@ -266,7 +253,12 @@ fn supervise(
     if let Err(err) = write_id_maps(pid, uid, gid) {
         return refuse_after_kill(init, &err.to_string());
     }
-    if let Err(err) = release.write_all(&[RELEASED]) {
+    // Maps can outrun a short timeout. Do not release a command whose deadline
+    // has already passed.
+    if Instant::now() >= deadline {
+        return finish_deadline(init);
+    }
+    if let Err(err) = control.write_all(&[RELEASED]) {
         let detail = format!("release: {err}");
         let extra = take_down(init).err();
         return Containment::Unavailable {
@@ -628,9 +620,7 @@ struct ExecImage {
     env_ptrs: Vec<usize>,
     stdout_write: i32,
     stderr_write: i32,
-    ack_write: i32,
-    release_read: i32,
-    close_in_child: [i32; 4],
+    control: i32,
     original_parent: i32,
     fail_arming: bool,
 }
@@ -640,9 +630,7 @@ impl ExecImage {
         command: &Command,
         stdout_write: i32,
         stderr_write: i32,
-        ack_write: i32,
-        release_read: i32,
-        close_in_child: [i32; 4],
+        control: i32,
     ) -> io::Result<Self> {
         let program = resolve_program(command.get_program())?;
         let mut argv = Vec::new();
@@ -666,9 +654,7 @@ impl ExecImage {
             env_ptrs,
             stdout_write,
             stderr_write,
-            ack_write,
-            release_read,
-            close_in_child,
+            control,
             original_parent: rustix::process::getpid().as_raw_pid(),
             fail_arming: arming_failure_injected(),
         })
@@ -687,16 +673,23 @@ fn arming_failure_injected() -> bool {
 }
 
 fn resolve_program(program: &OsStr) -> io::Result<CString> {
-    let path = Path::new(program);
-    if program.as_bytes().contains(&b'/') {
-        return cstring(path.as_os_str());
-    }
     let search = std::env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
-    for dir in std::env::split_paths(&search) {
-        let candidate = dir.join(path);
-        if candidate.is_file() {
-            return cstring(candidate.as_os_str());
+    resolve_program_in(program, search.as_os_str())
+}
+
+fn resolve_program_in(program: &OsStr, search: &OsStr) -> io::Result<CString> {
+    if program.as_bytes().contains(&b'/') {
+        return cstring(program);
+    }
+    for dir in std::env::split_paths(search) {
+        let candidate = dir.join(program);
+        if !candidate.is_file() {
+            continue;
         }
+        if rustix::fs::access(&candidate, rustix::fs::Access::EXEC_OK).is_err() {
+            continue;
+        }
+        return cstring(candidate.as_os_str());
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
@@ -740,8 +733,34 @@ fn pointer_words(values: &[CString]) -> Vec<usize> {
     words
 }
 
-#[allow(unsafe_code)]
+fn control_socket() -> io::Result<(UnixStream, UnixStream)> {
+    let mut fds = [-1_i32; 2];
+    // Safety: `socketpair` writes two new descriptors into `fds` on success.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safety: both descriptors were created by `socketpair` and this process
+    // owns them.
+    let parent = unsafe { UnixStream::from_raw_fd(fds[0]) };
+    let child = unsafe { UnixStream::from_raw_fd(fds[1]) };
+    Ok((parent, child))
+}
+
 fn clone3(flags: u64, pidfd: Option<&mut i32>, set_tid: Option<&mut i32>) -> io::Result<i32> {
+    clone3_raw(flags, pidfd, set_tid).map_err(io::Error::from_raw_os_error)
+}
+
+/// Raw `clone3`. The child calls this and `_exit`s on the errno. It does not
+/// build an `io::Error`.
+fn clone3_raw(flags: u64, pidfd: Option<&mut i32>, set_tid: Option<&mut i32>) -> Result<i32, i32> {
     // Safety: every field is a `u64`. Zero is the documented empty `clone_args`.
     let mut args: libc::clone_args = unsafe { std::mem::zeroed() };
     args.flags = flags;
@@ -760,22 +779,19 @@ fn clone3(flags: u64, pidfd: Option<&mut i32>, set_tid: Option<&mut i32>) -> io:
     // does. The child must exit instead of unwinding through this frame.
     let ret = unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of_val(&args)) };
     if ret < 0 {
-        Err(io::Error::last_os_error())
+        Err(last_errno())
     } else {
-        i32::try_from(ret).map_err(|_| io::Error::other("clone3 returned a pid that does not fit"))
+        i32::try_from(ret).map_err(|_| libc::ERANGE)
     }
 }
 
 fn enter_init(image: &ExecImage) -> ! {
-    for fd in image.close_in_child {
-        if fd >= 0 {
-            close_fd(fd);
-        }
-    }
+    retain_allowlisted_fds(image.control, image.stdout_write, image.stderr_write);
     if image.fail_arming {
         raw_exit(ARM_FAILED);
     }
-    if rustix::process::set_parent_process_death_signal(Some(Signal::KILL)).is_err() {
+    // Safety: `PR_SET_PDEATHSIG` takes the signal in the second argument.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
         raw_exit(ARM_FAILED);
     }
     // Inside the new pid namespace the creator is reported as 0. Any other
@@ -784,27 +800,58 @@ fn enter_init(image: &ExecImage) -> ! {
     if !parent_is_original(raw_getppid(), image.original_parent) {
         raw_exit(ARM_FAILED);
     }
-    if write_full(image.ack_write, &[RELEASED]).is_err() {
+    if write_full(FD_CONTROL, &[RELEASED]).is_err() {
         raw_exit(ARM_FAILED);
     }
     let mut release = [0_u8; 1];
-    if read_full(image.release_read, &mut release).is_err() || release[0] != RELEASED {
+    if read_full(FD_CONTROL, &mut release).is_err() || release[0] != RELEASED {
         raw_exit(ARM_FAILED);
     }
     // Leave the runtime's session before the command starts. `kill -STOP 0`
     // in the command must not stop the process that holds the init pidfd.
-    if rustix::process::setsid().is_err() {
+    if unsafe { libc::setsid() } < 0 {
         raw_exit(126);
     }
-    match clone3(0, None, None) {
+    match clone3_raw(0, None, None) {
         Ok(0) => become_command(image),
         Ok(shell) => {
-            close_fd(image.stdout_write);
-            close_fd(image.stderr_write);
+            unsafe {
+                libc::close(FD_STDOUT);
+                libc::close(FD_STDERR);
+            }
             reap_until_empty(shell);
         }
         Err(_) => raw_exit(127),
     }
+}
+
+/// Dup the control socket and the command's stdout and stderr onto fds 0, 1,
+/// and 2, then close every inherited descriptor from 3 up.
+fn retain_allowlisted_fds(control: i32, stdout: i32, stderr: i32) {
+    let control = park_above_stdio(control);
+    let stdout = park_above_stdio(stdout);
+    let stderr = park_above_stdio(stderr);
+    let moved =
+        dup_onto(control, FD_CONTROL) && dup_onto(stdout, FD_STDOUT) && dup_onto(stderr, FD_STDERR);
+    // Safety: fds below 3 are the allowlist installed just above. Flag 0
+    // closes the range instead of only marking it cloexec.
+    let closed = unsafe { libc::close_range(3, libc::c_uint::MAX, 0) };
+    if !moved || closed < 0 {
+        raw_exit(ARM_FAILED);
+    }
+}
+
+fn park_above_stdio(fd: i32) -> i32 {
+    if fd >= 3 {
+        return fd;
+    }
+    // Safety: `F_DUPFD` copies `fd` to the lowest free number at or above 3.
+    let moved = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
+    if moved < 0 {
+        return -1;
+    }
+    unsafe { libc::close(fd) };
+    moved
 }
 
 fn raw_exit(code: i32) -> ! {
@@ -825,27 +872,26 @@ fn become_command(image: &ExecImage) -> ! {
         raw_exit(127);
     }
     if let Some(cwd) = &image.cwd {
-        if rustix::process::chdir(cwd).is_err() {
+        // Safety: `cwd` is a NUL-terminated path prepared before `clone3`.
+        if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
             raw_exit(127);
         }
     }
-    // Safety: the descriptors were inherited across clone3 and are still open.
-    // `dup2` onto stdio clears cloexec on 0, 1, and 2. `execve` replaces this
-    // process, so the pointer tables only have to stay valid until it returns.
+    // Safety: fds 1 and 2 are the command pipes. `/dev/null` replaces the
+    // control socket on fd 0. The pointer tables stay valid until `execve`.
     unsafe {
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-        if null < 0
-            || libc::dup2(null, libc::STDIN_FILENO) < 0
-            || libc::dup2(image.stdout_write, libc::STDOUT_FILENO) < 0
-            || libc::dup2(image.stderr_write, libc::STDERR_FILENO) < 0
-        {
+        if null < 0 || !dup_onto(null, FD_CONTROL) {
             raw_exit(127);
         }
-        if null > libc::STDERR_FILENO {
-            let _ = libc::close(null);
+        if null != FD_CONTROL {
+            libc::close(null);
         }
-        let _ = rustix::runtime::execve(
-            image.program.as_c_str(),
+        if !dup_onto(FD_STDOUT, FD_STDOUT) || !dup_onto(FD_STDERR, FD_STDERR) {
+            raw_exit(127);
+        }
+        libc::execve(
+            image.program.as_ptr(),
             image.argv_ptrs.as_ptr().cast(),
             image.env_ptrs.as_ptr().cast(),
         );
@@ -853,13 +899,36 @@ fn become_command(image: &ExecImage) -> ! {
     raw_exit(127);
 }
 
+/// `dup2(fd, fd)` does not clear `FD_CLOEXEC`. Clear it explicitly when the
+/// source is already the target so the executed command keeps stdout and stderr.
+fn dup_onto(src: i32, dst: i32) -> bool {
+    if src < 0 {
+        return false;
+    }
+    unsafe {
+        if src == dst {
+            let flags = libc::fcntl(dst, libc::F_GETFD);
+            if flags < 0 {
+                return false;
+            }
+            return libc::fcntl(dst, libc::F_SETFD, flags & !libc::FD_CLOEXEC) >= 0;
+        }
+        libc::dup2(src, dst) >= 0
+    }
+}
+
 fn reap_until_empty(shell: i32) -> ! {
     let mut code = 127;
+    let mut latched = false;
     loop {
         match rustix::process::wait(WaitOptions::empty()) {
             Ok(Some((pid, status))) => {
-                if pid.as_raw_pid() == shell {
+                // A later `clone3(set_tid = shell)` reuses the pid. Record the
+                // shell status once and keep reaping without adopting the
+                // impostor's code.
+                if !latched && pid.as_raw_pid() == shell {
                     code = exit_code_from_wait(status);
+                    latched = true;
                 }
             }
             Ok(None) | Err(Errno::INTR) => {}
@@ -869,47 +938,47 @@ fn reap_until_empty(shell: i32) -> ! {
     }
 }
 
-fn close_fd(fd: i32) {
-    // Safety: `fd` is a descriptor inherited across clone3. Closing the child's
-    // copy does not close the parent's.
-    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+fn last_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
 }
 
-fn write_full(fd: i32, mut buf: &[u8]) -> io::Result<()> {
+fn write_full(fd: i32, mut buf: &[u8]) -> Result<(), i32> {
     while !buf.is_empty() {
         // Safety: `fd` is open in this process for the duration of the write.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        match rustix::io::write(borrowed, buf) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "command pipe write returned 0",
-                ));
+        let count = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if count < 0 {
+            let err = last_errno();
+            if err == libc::EINTR {
+                continue;
             }
-            Ok(count) => buf = &buf[count..],
-            Err(Errno::INTR) => {}
-            Err(err) => return Err(err.into()),
+            return Err(err);
         }
+        if count == 0 {
+            return Err(libc::EIO);
+        }
+        let count = usize::try_from(count).map_err(|_| libc::EIO)?;
+        buf = &buf[count..];
     }
     Ok(())
 }
 
-fn read_full(fd: i32, buf: &mut [u8]) -> io::Result<()> {
+fn read_full(fd: i32, buf: &mut [u8]) -> Result<(), i32> {
     let mut filled = 0;
     while filled < buf.len() {
         // Safety: `fd` is open in this process for the duration of the read.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        match rustix::io::read(borrowed, &mut buf[filled..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "command pipe closed",
-                ));
+        let count =
+            unsafe { libc::read(fd, buf[filled..].as_mut_ptr().cast(), buf.len() - filled) };
+        if count < 0 {
+            let err = last_errno();
+            if err == libc::EINTR {
+                continue;
             }
-            Ok(count) => filled += count,
-            Err(Errno::INTR) => {}
-            Err(err) => return Err(err.into()),
+            return Err(err);
         }
+        if count == 0 {
+            return Err(libc::EPIPE);
+        }
+        filled += usize::try_from(count).map_err(|_| libc::EIO)?;
     }
     Ok(())
 }
@@ -918,10 +987,14 @@ fn read_full(fd: i32, buf: &mut [u8]) -> io::Result<()> {
 #[allow(unsafe_code)]
 mod tests {
     use super::{
-        classify_reap, clone3, parent_is_original, signal_pidfd, write_full, write_id_maps, Reap,
+        classify_reap, clone3, clone3_raw, exit_code_from_waitid, parent_is_original,
+        reap_until_empty, resolve_program_in, signal_pidfd, write_full, write_id_maps, Reap,
     };
+    use std::ffi::OsStr;
     use std::io::Read;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn wait_error_is_not_a_timeout_even_at_the_deadline() {
@@ -940,6 +1013,27 @@ mod tests {
         assert!(parent_is_original(42, 42));
         assert!(!parent_is_original(1, 42));
         assert!(!parent_is_original(7, 42));
+    }
+
+    #[test]
+    fn path_lookup_skips_a_non_executable_file() {
+        let root = std::env::temp_dir().join(format!("claw-path-{}", std::process::id()));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).expect("first PATH dir");
+        std::fs::create_dir_all(&second).expect("second PATH dir");
+        let blocked = first.join("claw-sample");
+        let real = second.join("claw-sample");
+        std::fs::write(&blocked, b"#!/bin/sh\nprintf blocked\n").expect("blocked file");
+        std::fs::write(&real, b"#!/bin/sh\nprintf ok\n").expect("executable file");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644))
+            .expect("mode 0644");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).expect("mode 0755");
+        let search = std::env::join_paths([&first, &second]).expect("PATH");
+        let found = resolve_program_in(OsStr::new("claw-sample"), search.as_os_str())
+            .expect("later executable");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found.as_bytes(), real.as_os_str().as_bytes());
     }
 
     #[test]
@@ -999,6 +1093,118 @@ mod tests {
             message, "Y",
             "signaling the reaped init pidfd affected the process that reused its pid ({message})"
         );
+    }
+
+    #[test]
+    fn shell_status_stays_latched_when_its_pid_is_reused() {
+        const SHELL_STATUS: i32 = 42;
+        let (mut result_read, result_write) = std::io::pipe().expect("result pipe");
+        let (ack_read, ack_write) = std::io::pipe().expect("ack pipe");
+        let (release_read, release_write) = std::io::pipe().expect("release pipe");
+        let uid = rustix::process::getuid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
+        let mut pidfd_slot = -1;
+        let pid = clone3(
+            libc::CLONE_NEWUSER as u64 | libc::CLONE_NEWPID as u64,
+            Some(&mut pidfd_slot),
+            None,
+        )
+        .expect("lab namespace");
+        if pid == 0 {
+            for fd in [
+                result_read.as_raw_fd(),
+                ack_read.as_raw_fd(),
+                release_write.as_raw_fd(),
+            ] {
+                unsafe { libc::close(fd) };
+            }
+            latch_lab(
+                ack_write.as_raw_fd(),
+                release_read.as_raw_fd(),
+                result_write.as_raw_fd(),
+            );
+        }
+        drop(ack_write);
+        drop(release_read);
+        drop(result_write);
+        assert!(pidfd_slot >= 0, "lab clone3 did not return a pidfd");
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd_slot) };
+        let mut ack = [0_u8; 1];
+        ack_read.take(1).read_exact(&mut ack).expect("lab ack");
+        write_id_maps(pid, uid, gid).expect("lab id maps");
+        let mut release = release_write;
+        std::io::Write::write_all(&mut release, &[1]).expect("lab release");
+        drop(release);
+
+        let mut marker = [0_u8; 2];
+        let n = result_read.read(&mut marker).expect("reuse marker");
+        let marker = &marker[..n];
+        let status = rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.as_fd()),
+            rustix::process::WaitIdOptions::EXITED,
+        )
+        .expect("reap lab")
+        .expect("lab status");
+        assert_eq!(
+            marker, b"Y",
+            "the production reaper never saw a reused shell pid ({marker:?})"
+        );
+        assert_eq!(
+            exit_code_from_waitid(&status),
+            SHELL_STATUS,
+            "a descendant that reused the shell pid overwrote its exit status"
+        );
+    }
+
+    fn latch_lab(ack: i32, release: i32, result: i32) -> ! {
+        if write_full(ack, &[1]).is_err() {
+            super::raw_exit(2);
+        }
+        let mut byte = [0_u8; 1];
+        if super::read_full(release, &mut byte).is_err() || byte[0] != 1 {
+            super::raw_exit(2);
+        }
+        let shell = match clone3_raw(0, None, None) {
+            Ok(0) => super::raw_exit(42),
+            Ok(pid) => pid,
+            Err(_) => {
+                let _ = write_full(result, b"S");
+                super::raw_exit(70);
+            }
+        };
+        match clone3_raw(0, None, None) {
+            Ok(0) => reuse_shell_pid(shell, result),
+            Ok(_) => {}
+            Err(_) => {
+                let _ = write_full(result, b"I");
+                super::raw_exit(71);
+            }
+        }
+        reap_until_empty(shell);
+    }
+
+    fn reuse_shell_pid(shell: i32, result: i32) -> ! {
+        let mut tid = shell;
+        for _ in 0..1_000_000 {
+            match clone3_raw(0, None, Some(&mut tid)) {
+                Ok(0) => super::raw_exit(99),
+                Ok(pid) => {
+                    let marker: &[u8] = if pid == shell { b"Y" } else { b"M" };
+                    let _ = write_full(result, marker);
+                    // Do not reap. The child is reparented to the namespace
+                    // init, so the production reaper collects its status.
+                    super::raw_exit(0);
+                }
+                Err(err) if err == libc::EEXIST => {}
+                Err(err) => {
+                    let marker = [b'E', u8::try_from(err).unwrap_or(255)];
+                    let _ = write_full(result, &marker);
+                    super::raw_exit(86);
+                }
+            }
+        }
+        let _ = write_full(result, b"T");
+        super::raw_exit(86);
     }
 
     fn lab(ack: i32, release: i32, result: i32) -> ! {

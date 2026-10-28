@@ -873,6 +873,25 @@ os._exit(0)
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn timed_command_inherits_no_fds_above_stdio() {
+        let _guard = crate::test_env_lock();
+        let output = execute_bash(unsandboxed("exec ls -1 /proc/self/fd", Some(2_000), false))
+            .expect("fd probe should run");
+        assert!(!output.interrupted, "{}", output.stderr);
+        let fds: Vec<i32> = output
+            .stdout
+            .lines()
+            .map(|line| line.trim().parse().expect("fd number"))
+            .collect();
+        assert!(
+            fds.iter().all(|fd| *fd <= 3),
+            "command inherited a descriptor above stdio: {fds:?}\n{}",
+            output.stderr
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn release_waits_for_the_parent_death_ack() {
         let _guard = crate::test_env_lock();
         let _inject = crate::contain::inject_arming_failure();
