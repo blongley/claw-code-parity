@@ -4912,42 +4912,11 @@ mod tests {
         let _ = fs::remove_file(empty_notebook);
     }
 
-    fn stage_bash_supervisor_beside_test_exe() {
-        let Ok(exe) = std::env::current_exe() else {
-            return;
-        };
-        let Some(dir) = exe.parent() else {
-            return;
-        };
-        let Some(src_dir) = dir.parent() else {
-            return;
-        };
-        let src = src_dir.join("bash-supervisor");
-        if !src.is_file() {
-            return;
-        }
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let temporary = dir.join(format!(
-            ".bash-supervisor-{}-{nanos}.tmp",
-            std::process::id()
-        ));
-        if fs::copy(&src, &temporary).is_err() {
-            let _ = fs::remove_file(&temporary);
-            return;
-        }
-        if fs::rename(&temporary, dir.join("bash-supervisor")).is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-    }
-
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        stage_bash_supervisor_beside_test_exe();
         let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");

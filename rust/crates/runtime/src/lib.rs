@@ -18,23 +18,7 @@ mod remote;
 pub mod sandbox;
 mod session;
 mod sse;
-#[cfg(target_os = "linux")]
-mod supervisor;
 mod usage;
-
-/// Entry point for the `bash-supervisor` binary.
-#[doc(hidden)]
-#[must_use]
-pub fn bash_supervisor_main() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        supervisor::bash_supervisor_main()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        1
-    }
-}
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};

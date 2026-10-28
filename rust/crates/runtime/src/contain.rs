@@ -1,243 +1,711 @@
-//! Open a trusted supervisor binary and execute that file descriptor.
+//! Contain one timed command in a pid namespace created by this process.
 //!
-//! The check and the exec use the same descriptor (`O_PATH|O_NOFOLLOW`, then
-//! `execveat(AT_EMPTY_PATH)`), so a path swap after the check cannot change
-//! what runs. Parent directories are opened the same way, one component at a
-//! time, so a symlink above the file is rejected too.
+//! `clone3(CLONE_NEWUSER|CLONE_NEWPID|CLONE_PIDFD)` returns the init pidfd in
+//! the same syscall that creates the child, so teardown never reopens a pid
+//! that might have been reused. The child arms `PR_SET_PDEATHSIG` and checks
+//! `getppid` before it writes one ack byte. The parent writes the release byte
+//! only after that ack. Timeout and teardown are `pidfd_send_signal(SIGKILL)`
+//! and `waitid(P_PIDFD)` on the fd clone3 returned.
 
-use std::ffi::{CStr, CString, OsStr, OsString};
-use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+#![allow(unsafe_code)]
+
+#[cfg(test)]
+use std::cell::Cell;
+use std::ffi::{CString, OsStr};
+use std::io::{self, Read};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::CommandExt;
-use std::path::{Component, Path};
-use std::process::{Child, Command};
+use std::path::Path;
+use std::process::Command;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use rustix::fd::OwnedFd;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::io::Errno;
+use rustix::process::{Signal, WaitId, WaitIdOptions, WaitIdStatus, WaitOptions, WaitStatus};
 
-const DIR_FLAGS: OFlags = OFlags::PATH
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
-const FILE_FLAGS: OFlags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+/// Status text for a process that survived teardown. Not an exit code.
+pub(crate) const UNKILLABLE_STATUS: &str = "processes could not be killed";
 
-pub(crate) fn open_trusted_supervisor(path: &Path) -> io::Result<OwnedFd> {
-    if !path.is_absolute() {
-        return Err(io::Error::other("supervisor path must be absolute"));
+const RELEASED: u8 = 1;
+const ARM_FAILED: i32 = 86;
+const EMPTY_WAIT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Containment {
+    Finished(i32),
+    TimedOut,
+    Unkillable { detail: String },
+    Unavailable { detail: String },
+    Failed(String),
+}
+
+pub(crate) struct Captured {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NAMESPACE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_ARMING: Cell<bool> = const { Cell::new(false) };
+    static RELEASES: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+#[must_use = "the injected failure ends when this guard is dropped"]
+pub(crate) struct FailureGuard {
+    kind: FailureKind,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FailureKind {
+    Namespace,
+    Arming,
+}
+
+#[cfg(test)]
+pub(crate) fn inject_namespace_failure() -> FailureGuard {
+    FAIL_NAMESPACE.with(|cell| cell.set(true));
+    FailureGuard {
+        kind: FailureKind::Namespace,
     }
-    let mut names = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => names.push(name.to_os_string()),
-            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
-                return Err(io::Error::other("supervisor path must not contain . or .."));
-            }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_arming_failure() -> FailureGuard {
+    FAIL_ARMING.with(|cell| cell.set(true));
+    FailureGuard {
+        kind: FailureKind::Arming,
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailureGuard {
+    fn drop(&mut self) {
+        match self.kind {
+            FailureKind::Namespace => FAIL_NAMESPACE.with(|cell| cell.set(false)),
+            FailureKind::Arming => FAIL_ARMING.with(|cell| cell.set(false)),
         }
     }
-    let Some(file_name) = names.pop() else {
-        return Err(io::Error::other("supervisor path is missing a file name"));
-    };
-
-    let root = rustix::fs::open("/", DIR_FLAGS, Mode::empty()).map_err(io::Error::from)?;
-    trusted_directory(&root)?;
-    let mut current = root;
-    for name in &names {
-        current = rustix::fs::openat(&current, name.as_os_str(), DIR_FLAGS, Mode::empty())
-            .map_err(io::Error::from)?;
-        trusted_directory(&current)?;
-    }
-    let file = rustix::fs::openat(&current, file_name.as_os_str(), FILE_FLAGS, Mode::empty())
-        .map_err(io::Error::from)?;
-    trusted_file(&file)?;
-    Ok(file)
 }
 
-pub(crate) fn owner_is_trusted(owner: u32) -> bool {
-    owner == 0 || owner == rustix::process::getuid().as_raw()
+#[cfg(test)]
+pub(crate) fn release_count() -> u32 {
+    RELEASES.with(Cell::get)
 }
 
-fn trusted_directory(fd: &OwnedFd) -> io::Result<()> {
-    let stat = rustix::fs::fstat(fd).map_err(io::Error::from)?;
-    if !FileType::from_raw_mode(stat.st_mode).is_dir() {
-        return Err(io::Error::other(
-            "supervisor parent directory is not a directory",
+pub(crate) fn run_timed(
+    command: &Command,
+    timeout: Duration,
+) -> io::Result<(Containment, Captured)> {
+    #[cfg(test)]
+    RELEASES.with(|cell| cell.set(0));
+    if namespace_failure_injected() {
+        return Ok((
+            Containment::Unavailable {
+                detail: "clone3: Operation not permitted".to_string(),
+            },
+            empty_capture(),
         ));
     }
-    if !owner_is_trusted(stat.st_uid) {
-        return Err(io::Error::other(
-            "supervisor parent directory is not owned by the current user or root",
-        ));
-    }
-    let mode = Mode::from_raw_mode(stat.st_mode);
-    let group_or_other_write = mode.contains(Mode::WGRP) || mode.contains(Mode::WOTH);
-    let root_sticky = stat.st_uid == 0 && mode.contains(Mode::SVTX);
-    if group_or_other_write && !root_sticky {
-        return Err(io::Error::other(
-            "supervisor parent directory is writable by group or other",
-        ));
-    }
-    Ok(())
-}
 
-fn trusted_file(fd: &OwnedFd) -> io::Result<()> {
-    let stat = rustix::fs::fstat(fd).map_err(io::Error::from)?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
-        return Err(io::Error::other("supervisor is not a regular file"));
-    }
-    if !owner_is_trusted(stat.st_uid) {
-        return Err(io::Error::other(
-            "supervisor is not owned by the current user or root",
-        ));
-    }
-    let mode = Mode::from_raw_mode(stat.st_mode);
-    if mode.contains(Mode::WGRP) || mode.contains(Mode::WOTH) {
-        return Err(io::Error::other("supervisor is writable by group or other"));
-    }
-    Ok(())
-}
-
-/// Replace the forked child with the opened supervisor. `template` supplies
-/// the working directory and environment of the bash command.
-#[allow(unsafe_code)]
-pub(crate) fn spawn_trusted(
-    fd: &OwnedFd,
-    args: &[OsString],
-    template: &Command,
-) -> io::Result<Child> {
-    let mut argument_strings = Vec::with_capacity(args.len());
-    for arg in args {
-        argument_strings.push(cstring_from_os(arg)?);
-    }
-    let envp = environment_from(template)?;
-    // Pointer buffers are built before `fork`. `usize` keeps the closure
-    // `Send`, and `pre_exec` only reinterprets the same bits.
-    let argv_ptrs = pointer_words(&argument_strings);
-    let env_ptrs = pointer_words(&envp);
-    let raw = fd.as_raw_fd();
-    let mut command = Command::new("/bin/sh");
-    if let Some(dir) = template.get_current_dir() {
-        command.current_dir(dir);
-    }
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // Safety: `pre_exec` runs in the forked child. `execveat` replaces that
-    // child with the inode we already fstat'd, or returns without running
-    // `/bin/sh`. The descriptor was opened `O_CLOEXEC` and is still open
-    // across `fork`.
-    unsafe {
-        command.pre_exec(move || {
-            // `argument_strings` and `envp` own the bytes the pointer words
-            // address. Referencing them keeps those allocations alive until
-            // `execveat` returns, without allocating on the success path.
-            if argument_strings.len() + 1 != argv_ptrs.len() || envp.len() + 1 != env_ptrs.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "supervisor arguments changed before exec",
-                ));
-            }
-            // Safety: `raw` is the trusted descriptor inherited across `fork`.
-            // `execveat(AT_EMPTY_PATH)` replaces this process with that inode,
-            // so `/bin/sh` never runs. The pointer arrays are NUL-terminated
-            // and were built before `fork`. This call sits in the `unsafe`
-            // block that invokes `pre_exec`.
-            let err = rustix::runtime::execveat(
-                BorrowedFd::borrow_raw(raw),
-                empty_path(),
-                argv_ptrs.as_ptr().cast(),
-                env_ptrs.as_ptr().cast(),
-                AtFlags::EMPTY_PATH,
-            );
-            Err(io::Error::from(err))
-        });
-    }
-    command.spawn()
-}
-
-/// New session and parent-death signal. Used for the command inside a pid
-/// namespace, where killing pid 1 already tears the namespace down.
-#[allow(unsafe_code)]
-pub(crate) fn setsid_child(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            rustix::process::setsid().map_err(io::Error::from)?;
-            arm_parent_death()?;
-            Ok(())
-        });
-    }
-}
-
-fn arm_parent_death() -> io::Result<()> {
-    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
-        .map_err(io::Error::from)
-}
-
-/// Move this process into a new user namespace and a new pid namespace.
-///
-/// The caller stays in its original pid namespace. The next child becomes pid 1
-/// of the new one, and `SIGKILL` of that child kills every process in it.
-/// Fails closed: a mapping or `unshare` error returns before any child exists.
-#[allow(unsafe_code)]
-pub(crate) fn enter_user_and_pid_namespace() -> io::Result<()> {
+    let (stdout_read, stdout_write) = io::pipe()?;
+    let (stderr_read, stderr_write) = io::pipe()?;
+    let (mut ack_read, ack_write) = io::pipe()?;
+    let (release_read, mut release_write) = io::pipe()?;
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
-    // Safety: the flags are `CLONE_NEWUSER` and `CLONE_NEWPID`, not `CLONE_FILES`.
-    // The supervisor process has not spawned threads, so this cannot split a
-    // file-descriptor table out from under another thread.
-    unsafe {
-        rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::NEWUSER)
-            .map_err(io::Error::from)?;
+    let image = ExecImage::prepare(
+        command,
+        stdout_write.as_raw_fd(),
+        stderr_write.as_raw_fd(),
+        ack_write.as_raw_fd(),
+        release_read.as_raw_fd(),
+        [
+            stdout_read.as_raw_fd(),
+            stderr_read.as_raw_fd(),
+            ack_read.as_raw_fd(),
+            release_write.as_raw_fd(),
+        ],
+    )?;
+
+    let mut pidfd_slot = -1;
+    let pid = match clone3(
+        libc::CLONE_NEWUSER as u64 | libc::CLONE_NEWPID as u64,
+        Some(&mut pidfd_slot),
+        None,
+    ) {
+        Ok(0) => enter_init(&image),
+        Ok(pid) => pid,
+        Err(err) => {
+            return Ok((
+                Containment::Unavailable {
+                    detail: format!("clone3: {err}"),
+                },
+                empty_capture(),
+            ));
+        }
+    };
+    drop(stdout_write);
+    drop(stderr_write);
+    drop(ack_write);
+    drop(release_read);
+
+    if pidfd_slot < 0 {
+        let detail = match kill_live_pid(pid) {
+            Ok(()) => "clone3 did not return a pidfd".to_string(),
+            Err(err) => format!("clone3 did not return a pidfd; {err}"),
+        };
+        return Ok((Containment::Unkillable { detail }, empty_capture()));
     }
-    write_id_maps(uid, gid)?;
-    unsafe {
-        rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::NEWPID)
-            .map_err(io::Error::from)?;
-    }
-    Ok(())
+    // Safety: clone3 wrote a new CLOEXEC pidfd into `pidfd_slot` and this
+    // process owns that descriptor.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd_slot) };
+    let mut init = HeldInit {
+        pidfd,
+        reaped: false,
+    };
+    let deadline = Instant::now() + timeout;
+    let reader_deadline = deadline + Duration::from_secs(3);
+    let stdout_thread = spawn_reader(stdout_read, reader_deadline);
+    let stderr_thread = spawn_reader(stderr_read, reader_deadline);
+    let outcome = supervise(
+        &mut init,
+        pid,
+        &mut ack_read,
+        &mut release_write,
+        uid,
+        gid,
+        deadline,
+    );
+    let stdout = join_reader(stdout_thread)?;
+    let stderr = join_reader(stderr_thread)?;
+    Ok((
+        outcome,
+        Captured {
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        },
+    ))
 }
 
-fn write_id_maps(uid: u32, gid: u32) -> io::Result<()> {
-    std::fs::write("/proc/self/setgroups", b"deny\n")
+fn namespace_failure_injected() -> bool {
+    #[cfg(test)]
+    {
+        FAIL_NAMESPACE.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn empty_capture() -> Captured {
+    Captured {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+struct HeldInit {
+    pidfd: OwnedFd,
+    reaped: bool,
+}
+
+impl Drop for HeldInit {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        self.reaped = true;
+        if let Err(err) = kill_and_reap(&self.pidfd) {
+            eprintln!("bash containment cleanup: {err}");
+        }
+    }
+}
+
+fn supervise(
+    init: &mut HeldInit,
+    pid: i32,
+    ack: &mut (impl Read + AsFd),
+    release: &mut impl io::Write,
+    uid: u32,
+    gid: u32,
+    deadline: Instant,
+) -> Containment {
+    match wait_for_ack(ack, &init.pidfd, deadline) {
+        Ack::Ready => {}
+        Ack::Exited => {
+            return match reap_exit(&init.pidfd) {
+                Ok(code) => {
+                    init.reaped = true;
+                    Containment::Unavailable {
+                        detail: format!(
+                            "pid namespace init did not arm parent-death signal (exit {code})"
+                        ),
+                    }
+                }
+                Err(detail) => {
+                    let extra = take_down(init).err();
+                    Containment::Failed(join_detail(&detail, extra.as_deref()))
+                }
+            };
+        }
+        Ack::Rejected => {
+            return refuse_after_kill(init, "pid namespace init sent a bad ack");
+        }
+        Ack::Deadline => return finish_deadline(init),
+        Ack::Failed(detail) => {
+            let extra = take_down(init).err();
+            return Containment::Failed(join_detail(&detail, extra.as_deref()));
+        }
+    }
+
+    if let Err(err) = write_id_maps(pid, uid, gid) {
+        return refuse_after_kill(init, &err.to_string());
+    }
+    if let Err(err) = release.write_all(&[RELEASED]) {
+        let detail = format!("release: {err}");
+        let extra = take_down(init).err();
+        return Containment::Unavailable {
+            detail: join_detail(&detail, extra.as_deref()),
+        };
+    }
+    #[cfg(test)]
+    RELEASES.with(|cell| cell.set(cell.get().saturating_add(1)));
+
+    match watch_init(&init.pidfd, deadline) {
+        Ok(code) => {
+            init.reaped = true;
+            Containment::Finished(code)
+        }
+        Err(WatchError::Deadline) => finish_deadline(init),
+        Err(WatchError::Failed(detail)) => {
+            let extra = take_down(init).err();
+            Containment::Failed(join_detail(&detail, extra.as_deref()))
+        }
+    }
+}
+
+fn refuse_after_kill(init: &mut HeldInit, detail: &str) -> Containment {
+    match take_down(init) {
+        Ok(()) => Containment::Unavailable {
+            detail: detail.to_string(),
+        },
+        Err(err) => Containment::Unkillable {
+            detail: join_detail(detail, Some(&err)),
+        },
+    }
+}
+
+fn finish_deadline(init: &mut HeldInit) -> Containment {
+    match take_down(init) {
+        Ok(()) => Containment::TimedOut,
+        Err(detail) => Containment::Unkillable { detail },
+    }
+}
+
+fn take_down(init: &mut HeldInit) -> Result<(), String> {
+    if init.reaped {
+        return Ok(());
+    }
+    init.reaped = true;
+    kill_and_reap(&init.pidfd)
+}
+
+enum Ack {
+    Ready,
+    Exited,
+    Rejected,
+    Deadline,
+    Failed(String),
+}
+
+fn wait_for_ack(ack: &mut (impl Read + AsFd), pidfd: &OwnedFd, deadline: Instant) -> Ack {
+    loop {
+        if Instant::now() >= deadline {
+            return Ack::Deadline;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = Timespec::try_from(remaining).ok();
+        let mut fds = [
+            PollFd::new(ack, PollFlags::IN),
+            PollFd::new(pidfd, PollFlags::IN),
+        ];
+        match rustix::event::poll(&mut fds, timeout.as_ref()) {
+            Ok(0) => return Ack::Deadline,
+            Ok(_) => {
+                let ack_ready = fds[0]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
+                let init_ready = fds[1]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
+                if ack_ready {
+                    match read_ack(ack) {
+                        Ok(Some(RELEASED)) => return Ack::Ready,
+                        Ok(Some(_)) => return Ack::Rejected,
+                        Ok(None) => return Ack::Exited,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        Err(err) => return Ack::Failed(format!("ack: {err}")),
+                    }
+                } else if init_ready {
+                    return Ack::Exited;
+                }
+            }
+            Err(Errno::INTR) => {}
+            Err(err) => return Ack::Failed(format!("ack wait: {err}")),
+        }
+    }
+}
+
+fn read_ack(ack: &mut impl Read) -> io::Result<Option<u8>> {
+    let mut buf = [0_u8; 1];
+    match ack.read(&mut buf)? {
+        0 => Ok(None),
+        _ => Ok(Some(buf[0])),
+    }
+}
+
+enum WatchError {
+    Deadline,
+    Failed(String),
+}
+
+fn watch_init(pidfd: &OwnedFd, deadline: Instant) -> Result<i32, WatchError> {
+    loop {
+        let deadline_reached = Instant::now() >= deadline;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = Timespec::try_from(remaining).ok();
+        let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
+        let poll = if deadline_reached {
+            rustix::event::poll(&mut fds, Some(&Timespec::default()))
+        } else {
+            rustix::event::poll(&mut fds, timeout.as_ref())
+        };
+        let ready = match poll {
+            Ok(0) => false,
+            Ok(_) => fds[0]
+                .revents()
+                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
+            Err(Errno::INTR) => continue,
+            Err(err) => {
+                return Err(WatchError::Failed(format!("pidfd wait: {err}")));
+            }
+        };
+        if !ready {
+            if deadline_reached {
+                return Err(WatchError::Deadline);
+            }
+            continue;
+        }
+        match reap_once(pidfd) {
+            Reap::Exited(code) => return Ok(code),
+            Reap::Gone => {
+                return Err(WatchError::Failed(
+                    "wait: pid namespace init was not a child".to_string(),
+                ));
+            }
+            Reap::Retry if deadline_reached => return Err(WatchError::Deadline),
+            Reap::Retry => thread::sleep(Duration::from_millis(1)),
+            Reap::Failed(detail) => return Err(WatchError::Failed(detail)),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Reap {
+    Exited(i32),
+    Retry,
+    Gone,
+    Failed(String),
+}
+
+/// A `waitid` error is failed immediately. `Ok(None)` only means the child is
+/// still running, so the caller may wait out the deadline.
+fn classify_reap(result: Result<Option<i32>, String>) -> Reap {
+    match result {
+        Err(detail) => Reap::Failed(detail),
+        Ok(Some(code)) => Reap::Exited(code),
+        Ok(None) => Reap::Retry,
+    }
+}
+
+fn reap_once(pidfd: &OwnedFd) -> Reap {
+    let waited = match rustix::process::waitid(
+        WaitId::PidFd(pidfd.as_fd()),
+        WaitIdOptions::EXITED.union(WaitIdOptions::NOHANG),
+    ) {
+        Ok(Some(status)) => Ok(Some(exit_code_from_waitid(&status))),
+        Ok(None) | Err(Errno::INTR) => Ok(None),
+        Err(Errno::CHILD) => return Reap::Gone,
+        Err(err) => Err(format!("wait: {err}")),
+    };
+    classify_reap(waited)
+}
+
+fn reap_exit(pidfd: &OwnedFd) -> Result<i32, String> {
+    let deadline = Instant::now() + EMPTY_WAIT;
+    loop {
+        match reap_once(pidfd) {
+            Reap::Exited(code) => return Ok(code),
+            Reap::Gone => return Err("wait: pid namespace init was not a child".to_string()),
+            Reap::Failed(detail) => return Err(detail),
+            Reap::Retry if Instant::now() >= deadline => {
+                return Err("wait returned no status".to_string());
+            }
+            Reap::Retry => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn kill_and_reap(pidfd: &OwnedFd) -> Result<(), String> {
+    let killed = match signal_pidfd(pidfd) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(format!("pidfd kill: {err}")),
+    };
+    let waited = wait_until_dead(pidfd);
+    match (killed, waited) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(kill_error), Ok(())) => Err(kill_error),
+        (Ok(()), Err(wait_error)) => Err(wait_error),
+        (Err(kill_error), Err(wait_error)) => Err(format!("{kill_error}; {wait_error}")),
+    }
+}
+
+fn signal_pidfd(pidfd: &OwnedFd) -> Result<(), Errno> {
+    match rustix::process::pidfd_send_signal(pidfd, Signal::KILL) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn wait_until_dead(pidfd: &OwnedFd) -> Result<(), String> {
+    let deadline = Instant::now() + EMPTY_WAIT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = Timespec::try_from(remaining).ok();
+        let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, timeout.as_ref()) {
+            Ok(0) => return Err("process still running after SIGKILL".to_string()),
+            Ok(_) => {
+                return match reap_once(pidfd) {
+                    Reap::Exited(_) | Reap::Gone => Ok(()),
+                    Reap::Failed(detail) => Err(detail),
+                    Reap::Retry if Instant::now() >= deadline => {
+                        Err("process still running after SIGKILL".to_string())
+                    }
+                    Reap::Retry => continue,
+                };
+            }
+            Err(Errno::INTR) if Instant::now() >= deadline => {
+                return Err("process still running after SIGKILL".to_string());
+            }
+            Err(Errno::INTR) => {}
+            Err(err) => return Err(format!("pidfd wait: {err}")),
+        }
+    }
+}
+
+fn kill_live_pid(pid: i32) -> Result<(), String> {
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        return Err("kill: pid is not a process id".to_string());
+    };
+    match rustix::process::kill_process(pid, Signal::KILL) {
+        Ok(()) | Err(Errno::SRCH) => {}
+        Err(err) => return Err(format!("kill: {err}")),
+    }
+    match rustix::process::waitpid(Some(pid), WaitOptions::empty()) {
+        Ok(_) | Err(Errno::CHILD) => Ok(()),
+        Err(err) => Err(format!("wait: {err}")),
+    }
+}
+
+fn write_id_maps(pid: i32, uid: u32, gid: u32) -> io::Result<()> {
+    let proc = format!("/proc/{pid}");
+    std::fs::write(format!("{proc}/setgroups"), b"deny\n")
         .map_err(|err| io::Error::other(format!("setgroups: {err}")))?;
-    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
+    std::fs::write(format!("{proc}/uid_map"), format!("0 {uid} 1\n"))
         .map_err(|err| io::Error::other(format!("uid_map: {err}")))?;
-    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
+    std::fs::write(format!("{proc}/gid_map"), format!("0 {gid} 1\n"))
         .map_err(|err| io::Error::other(format!("gid_map: {err}")))?;
     Ok(())
 }
 
-pub(crate) enum ForkResult {
-    Parent(u32),
-    Child,
+fn exit_code_from_waitid(status: &WaitIdStatus) -> i32 {
+    if let Some(code) = status.exit_status() {
+        return code;
+    }
+    status
+        .terminating_signal()
+        .map_or(1, |signal| 128_i32.saturating_add(signal))
 }
 
-/// Fork the supervisor. The supervisor is single-threaded here: it is a fresh
-/// exec and has not spawned threads. The child must `process::exit` and must
-/// not return into the parent's frames.
-#[allow(unsafe_code)]
-pub(crate) fn fork_process() -> io::Result<ForkResult> {
-    // `fork` is the libc entry the process is already linked against. rustix
-    // has no fork wrapper. Safety: one thread, and the child exits instead of
-    // unwinding through the parent's destructors.
-    extern "C" {
-        fn fork() -> i32;
+fn exit_code_from_wait(status: WaitStatus) -> i32 {
+    if let Some(code) = status.exit_status() {
+        return code;
     }
-    let pid = unsafe { fork() };
-    match pid {
-        -1 => Err(io::Error::last_os_error()),
-        0 => Ok(ForkResult::Child),
-        raw => u32::try_from(raw)
-            .map(ForkResult::Parent)
-            .map_err(|_| io::Error::other("fork returned a pid that does not fit in a u32")),
+    status
+        .terminating_signal()
+        .map_or(1, |signal| 128_i32.saturating_add(signal))
+}
+
+fn join_detail(left: &str, right: Option<&str>) -> String {
+    match right {
+        None | Some("") => left.to_string(),
+        Some(right) if left.is_empty() => right.to_string(),
+        Some(right) => format!("{left}; {right}"),
     }
 }
 
-fn cstring_from_os(value: &OsStr) -> io::Result<CString> {
-    CString::new(value.as_bytes())
-        .map_err(|_| io::Error::other("supervisor argument contains a NUL"))
+struct PipeRead {
+    bytes: Vec<u8>,
+}
+
+fn spawn_reader(
+    pipe: impl Read + AsFd + Send + 'static,
+    deadline: Instant,
+) -> JoinHandle<io::Result<PipeRead>> {
+    thread::spawn(move || read_pipe_until(pipe, deadline))
+}
+
+fn read_pipe_until(mut pipe: impl Read + AsFd, deadline: Instant) -> io::Result<PipeRead> {
+    let mut bytes = Vec::new();
+    let mut buf = [0_u8; 8_192];
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(PipeRead { bytes });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(timeout) = Timespec::try_from(remaining) else {
+            return Ok(PipeRead { bytes });
+        };
+        let events = {
+            let mut fds = [PollFd::new(&pipe, PollFlags::IN)];
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Ok(0) => return Ok(PipeRead { bytes }),
+                Ok(_) => fds[0].revents(),
+                Err(Errno::INTR) => continue,
+                Err(err) => return Err(err.into()),
+            }
+        };
+        if events.contains(PollFlags::NVAL) {
+            return Err(io::Error::other("command output pipe is not pollable"));
+        }
+        if !events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+            continue;
+        }
+        match pipe.read(&mut buf) {
+            Ok(0) => return Ok(PipeRead { bytes }),
+            Ok(count) => bytes.extend_from_slice(&buf[..count]),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn join_reader(handle: JoinHandle<io::Result<PipeRead>>) -> io::Result<PipeRead> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other(
+            "command output reader stopped unexpectedly",
+        )),
+    }
+}
+
+struct ExecImage {
+    program: CString,
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+    cwd: Option<CString>,
+    argv_ptrs: Vec<usize>,
+    env_ptrs: Vec<usize>,
+    stdout_write: i32,
+    stderr_write: i32,
+    ack_write: i32,
+    release_read: i32,
+    close_in_child: [i32; 4],
+    original_parent: i32,
+    fail_arming: bool,
+}
+
+impl ExecImage {
+    fn prepare(
+        command: &Command,
+        stdout_write: i32,
+        stderr_write: i32,
+        ack_write: i32,
+        release_read: i32,
+        close_in_child: [i32; 4],
+    ) -> io::Result<Self> {
+        let program = resolve_program(command.get_program())?;
+        let mut argv = Vec::new();
+        argv.push(cstring(command.get_program())?);
+        for arg in command.get_args() {
+            argv.push(cstring(arg)?);
+        }
+        let envp = environment_from(command)?;
+        let cwd = command
+            .get_current_dir()
+            .map(|dir| cstring(dir.as_os_str()))
+            .transpose()?;
+        let argv_ptrs = pointer_words(&argv);
+        let env_ptrs = pointer_words(&envp);
+        Ok(Self {
+            program,
+            argv,
+            envp,
+            cwd,
+            argv_ptrs,
+            env_ptrs,
+            stdout_write,
+            stderr_write,
+            ack_write,
+            release_read,
+            close_in_child,
+            original_parent: rustix::process::getpid().as_raw_pid(),
+            fail_arming: arming_failure_injected(),
+        })
+    }
+}
+
+fn arming_failure_injected() -> bool {
+    #[cfg(test)]
+    {
+        FAIL_ARMING.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn resolve_program(program: &OsStr) -> io::Result<CString> {
+    let path = Path::new(program);
+    if program.as_bytes().contains(&b'/') {
+        return cstring(path.as_os_str());
+    }
+    let search = std::env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
+    for dir in std::env::split_paths(&search) {
+        let candidate = dir.join(path);
+        if candidate.is_file() {
+            return cstring(candidate.as_os_str());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("command not found: {}", program.to_string_lossy()),
+    ))
+}
+
+fn cstring(value: &OsStr) -> io::Result<CString> {
+    CString::new(value.as_bytes()).map_err(|_| io::Error::other("command argument contains a NUL"))
 }
 
 fn environment_from(template: &Command) -> io::Result<Vec<CString>> {
@@ -272,6 +740,333 @@ fn pointer_words(values: &[CString]) -> Vec<usize> {
     words
 }
 
-fn empty_path() -> &'static CStr {
-    c""
+#[allow(unsafe_code)]
+fn clone3(flags: u64, pidfd: Option<&mut i32>, set_tid: Option<&mut i32>) -> io::Result<i32> {
+    // Safety: every field is a `u64`. Zero is the documented empty `clone_args`.
+    let mut args: libc::clone_args = unsafe { std::mem::zeroed() };
+    args.flags = flags;
+    args.exit_signal = libc::SIGCHLD as u64;
+    if let Some(slot) = pidfd {
+        *slot = -1;
+        args.flags |= libc::CLONE_PIDFD as u64;
+        args.pidfd = std::ptr::from_mut::<i32>(slot) as u64;
+    }
+    if let Some(tid) = set_tid {
+        args.set_tid = std::ptr::from_mut::<i32>(tid) as u64;
+        args.set_tid_size = 1;
+    }
+    // Safety: `stack` is null and `CLONE_VM` is not set, so the child gets its
+    // own address space and continues after the syscall, the same way `fork`
+    // does. The child must exit instead of unwinding through this frame.
+    let ret = unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of_val(&args)) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        i32::try_from(ret).map_err(|_| io::Error::other("clone3 returned a pid that does not fit"))
+    }
+}
+
+fn enter_init(image: &ExecImage) -> ! {
+    for fd in image.close_in_child {
+        if fd >= 0 {
+            close_fd(fd);
+        }
+    }
+    if image.fail_arming {
+        raw_exit(ARM_FAILED);
+    }
+    if rustix::process::set_parent_process_death_signal(Some(Signal::KILL)).is_err() {
+        raw_exit(ARM_FAILED);
+    }
+    // Inside the new pid namespace the creator is reported as 0. Any other
+    // unexpected parent means this process was reparented before the death
+    // signal was armed.
+    if !parent_is_original(raw_getppid(), image.original_parent) {
+        raw_exit(ARM_FAILED);
+    }
+    if write_full(image.ack_write, &[RELEASED]).is_err() {
+        raw_exit(ARM_FAILED);
+    }
+    let mut release = [0_u8; 1];
+    if read_full(image.release_read, &mut release).is_err() || release[0] != RELEASED {
+        raw_exit(ARM_FAILED);
+    }
+    // Leave the runtime's session before the command starts. `kill -STOP 0`
+    // in the command must not stop the process that holds the init pidfd.
+    if rustix::process::setsid().is_err() {
+        raw_exit(126);
+    }
+    match clone3(0, None, None) {
+        Ok(0) => become_command(image),
+        Ok(shell) => {
+            close_fd(image.stdout_write);
+            close_fd(image.stderr_write);
+            reap_until_empty(shell);
+        }
+        Err(_) => raw_exit(127),
+    }
+}
+
+fn raw_exit(code: i32) -> ! {
+    unsafe { libc::_exit(code) }
+}
+
+fn raw_getppid() -> i32 {
+    unsafe { libc::getppid() }
+}
+
+fn parent_is_original(ppid: i32, original: i32) -> bool {
+    ppid == original || (ppid == 0 && original > 0)
+}
+
+fn become_command(image: &ExecImage) -> ! {
+    if image.argv.len() + 1 != image.argv_ptrs.len() || image.envp.len() + 1 != image.env_ptrs.len()
+    {
+        raw_exit(127);
+    }
+    if let Some(cwd) = &image.cwd {
+        if rustix::process::chdir(cwd).is_err() {
+            raw_exit(127);
+        }
+    }
+    // Safety: the descriptors were inherited across clone3 and are still open.
+    // `dup2` onto stdio clears cloexec on 0, 1, and 2. `execve` replaces this
+    // process, so the pointer tables only have to stay valid until it returns.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        if null < 0
+            || libc::dup2(null, libc::STDIN_FILENO) < 0
+            || libc::dup2(image.stdout_write, libc::STDOUT_FILENO) < 0
+            || libc::dup2(image.stderr_write, libc::STDERR_FILENO) < 0
+        {
+            raw_exit(127);
+        }
+        if null > libc::STDERR_FILENO {
+            let _ = libc::close(null);
+        }
+        let _ = rustix::runtime::execve(
+            image.program.as_c_str(),
+            image.argv_ptrs.as_ptr().cast(),
+            image.env_ptrs.as_ptr().cast(),
+        );
+    }
+    raw_exit(127);
+}
+
+fn reap_until_empty(shell: i32) -> ! {
+    let mut code = 127;
+    loop {
+        match rustix::process::wait(WaitOptions::empty()) {
+            Ok(Some((pid, status))) => {
+                if pid.as_raw_pid() == shell {
+                    code = exit_code_from_wait(status);
+                }
+            }
+            Ok(None) | Err(Errno::INTR) => {}
+            Err(Errno::CHILD) => raw_exit(code),
+            Err(_) => raw_exit(126),
+        }
+    }
+}
+
+fn close_fd(fd: i32) {
+    // Safety: `fd` is a descriptor inherited across clone3. Closing the child's
+    // copy does not close the parent's.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+}
+
+fn write_full(fd: i32, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        // Safety: `fd` is open in this process for the duration of the write.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match rustix::io::write(borrowed, buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "command pipe write returned 0",
+                ));
+            }
+            Ok(count) => buf = &buf[count..],
+            Err(Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_full(fd: i32, buf: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        // Safety: `fd` is open in this process for the duration of the read.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match rustix::io::read(borrowed, &mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "command pipe closed",
+                ));
+            }
+            Ok(count) => filled += count,
+            Err(Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod tests {
+    use super::{
+        classify_reap, clone3, parent_is_original, signal_pidfd, write_full, write_id_maps, Reap,
+    };
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[test]
+    fn wait_error_is_not_a_timeout_even_at_the_deadline() {
+        let outcome = classify_reap(Err("wait: bad file descriptor".to_string()));
+        assert!(
+            matches!(outcome, Reap::Failed(ref detail) if detail.contains("wait:")),
+            "a wait error must not lapse into a timeout: {outcome:?}"
+        );
+        assert!(matches!(classify_reap(Ok(None)), Reap::Retry));
+        assert!(matches!(classify_reap(Ok(Some(0))), Reap::Exited(0)));
+    }
+
+    #[test]
+    fn pid_namespace_init_sees_its_outside_parent_as_zero() {
+        assert!(parent_is_original(0, 42));
+        assert!(parent_is_original(42, 42));
+        assert!(!parent_is_original(1, 42));
+        assert!(!parent_is_original(7, 42));
+    }
+
+    #[test]
+    fn reaped_init_pidfd_does_not_kill_a_process_that_reused_its_pid() {
+        let (result_read, result_write) = std::io::pipe().expect("result pipe");
+        let (ack_read, ack_write) = std::io::pipe().expect("ack pipe");
+        let (release_read, release_write) = std::io::pipe().expect("release pipe");
+        let uid = rustix::process::getuid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
+        let mut pidfd_slot = -1;
+        let pid = clone3(
+            libc::CLONE_NEWUSER as u64 | libc::CLONE_NEWPID as u64,
+            Some(&mut pidfd_slot),
+            None,
+        )
+        .expect("lab namespace");
+        if pid == 0 {
+            // Close the parent's ends in this child only. The `OwnedFd` values
+            // stay with the parent; `close` affects this fd table.
+            for fd in [
+                result_read.as_raw_fd(),
+                ack_read.as_raw_fd(),
+                release_write.as_raw_fd(),
+            ] {
+                unsafe { libc::close(fd) };
+            }
+            lab(
+                ack_write.as_raw_fd(),
+                release_read.as_raw_fd(),
+                result_write.as_raw_fd(),
+            );
+        }
+        drop(ack_write);
+        drop(release_read);
+        drop(result_write);
+        assert!(pidfd_slot >= 0, "lab clone3 did not return a pidfd");
+        // Safety: clone3 installed this pidfd in the parent.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd_slot) };
+        let mut ack = [0_u8; 1];
+        ack_read.take(1).read_exact(&mut ack).expect("lab ack");
+        write_id_maps(pid, uid, gid).expect("lab id maps");
+        let mut release = release_write;
+        std::io::Write::write_all(&mut release, &[1]).expect("lab release");
+        drop(release);
+
+        let mut message = String::new();
+        result_read
+            .take(64)
+            .read_to_string(&mut message)
+            .expect("lab result");
+        let _ = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid),
+            rustix::process::WaitOptions::empty(),
+        );
+        drop(pidfd);
+        assert_eq!(
+            message, "Y",
+            "signaling the reaped init pidfd affected the process that reused its pid ({message})"
+        );
+    }
+
+    fn lab(ack: i32, release: i32, result: i32) -> ! {
+        if write_full(ack, &[1]).is_err() {
+            super::raw_exit(2);
+        }
+        let mut byte = [0_u8; 1];
+        if super::read_full(release, &mut byte).is_err() || byte[0] != 1 {
+            super::raw_exit(2);
+        }
+        let mut first_slot = -1;
+        let first = match clone3(0, Some(&mut first_slot), None) {
+            Ok(0) => super::raw_exit(0),
+            Ok(pid) => pid,
+            Err(_) => report(result, b'E'),
+        };
+        // Safety: clone3 installed this pidfd for the first child.
+        let first_fd = unsafe { OwnedFd::from_raw_fd(first_slot) };
+        unsafe {
+            let _ = libc::waitpid(first, std::ptr::null_mut(), 0);
+        }
+        let mut wanted = first;
+        let mut second_slot = -1;
+        let second = match clone3(0, Some(&mut second_slot), Some(&mut wanted)) {
+            Ok(0) => {
+                unsafe {
+                    let _ = libc::pause();
+                }
+                super::raw_exit(0);
+            }
+            Ok(pid) => pid,
+            Err(_) => report(result, b'E'),
+        };
+        // Safety: clone3 installed this pidfd for the reused pid.
+        let second_fd = unsafe { OwnedFd::from_raw_fd(second_slot) };
+        let signaled = signal_pidfd(&first_fd);
+        let alive = pidfd_alive(&second_fd);
+        let message: &[u8] = if signaled.is_err() {
+            b"S"
+        } else if second != first {
+            b"M"
+        } else if alive {
+            b"Y"
+        } else {
+            b"N"
+        };
+        let _ = write_full(result, message);
+        let _ = signal_pidfd(&second_fd);
+        super::raw_exit(0);
+    }
+
+    fn report(result: i32, kind: u8) -> ! {
+        let _ = write_full(result, &[kind]);
+        super::raw_exit(1);
+    }
+
+    fn pidfd_alive(pidfd: &OwnedFd) -> bool {
+        // Safety: signal 0 on a pidfd checks that the same task is alive. It
+        // does not follow a reused pid number.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        rc == 0
+    }
 }
