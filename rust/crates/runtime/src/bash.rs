@@ -892,6 +892,163 @@ os._exit(0)
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn init_holds_no_fds_above_stdio() {
+        let _guard = crate::test_env_lock();
+        assert_init_stdio_only(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn init_holds_no_fds_above_stdio_when_close_range_is_missing() {
+        let _guard = crate::test_env_lock();
+        let _walk = crate::contain::inject_fd_walk();
+        assert_init_stdio_only(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_init_stdio_only(walk: bool) {
+        // `exec` replaces the shell, so this process's parent is namespace
+        // init. `/proc` is the host mount: `PPid` is init's global pid, while
+        // `/proc/1` is the host init.
+        let output = execute_bash(unsandboxed(
+            r#"exec python3 -c 'import os
+text = open("/proc/self/status").read().splitlines()
+ppid = next(line.split()[1] for line in text if line.startswith("PPid:"))
+names = sorted(os.listdir("/proc/%s/fd" % ppid), key=lambda name: int(name))
+print("\n".join(names))
+'"#,
+            Some(2_000),
+            false,
+        ))
+        .expect("init fd probe should run");
+        assert!(!output.interrupted, "{}", output.stderr);
+        let fds: Vec<i32> = output
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.trim().parse().expect("fd number"))
+            .collect();
+        assert!(
+            !fds.is_empty(),
+            "init fd list was empty (walk {walk}): {}\n{}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            fds.iter().all(|fd| *fd <= 2),
+            "init held a descriptor above stdio (walk {walk}): {fds:?}\n{}",
+            output.stderr
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlapping_launches_do_not_hold_each_others_output() {
+        let _guard = crate::test_env_lock();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let slow = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let _overlap = crate::contain::overlap_at_clone(barrier);
+                execute_bash(unsandboxed("sleep 1.5; printf slow", Some(5_000), false))
+            })
+        };
+        let fast = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let _overlap = crate::contain::overlap_at_clone(barrier);
+                let started = std::time::Instant::now();
+                let output = execute_bash(unsandboxed("printf fast", Some(4_000), false));
+                (output, started.elapsed())
+            })
+        };
+        let (fast_output, fast_elapsed) = fast.join().expect("fast launch");
+        let slow_output = slow.join().expect("slow launch");
+        let fast_output = fast_output.expect("fast command");
+        let slow_output = slow_output.expect("slow command");
+
+        assert_eq!(fast_output.stdout, "fast");
+        assert!(!fast_output.interrupted, "{}", fast_output.stderr);
+        assert!(
+            fast_elapsed < std::time::Duration::from_millis(1_000),
+            "fast command waited {fast_elapsed:?} for the overlapping init to release its stdout"
+        );
+        assert_eq!(slow_output.stdout, "slow");
+        assert!(!slow_output.interrupted, "{}", slow_output.stderr);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deadline_that_passes_before_release_does_not_start_the_command() {
+        let _guard = crate::test_env_lock();
+        let _delay = crate::contain::delay_release_by(std::time::Duration::from_millis(400));
+        let marker = std::env::temp_dir().join(unique_token("late-deadline"));
+        let _ = std::fs::remove_file(&marker);
+        let started = std::time::Instant::now();
+        let output = execute_bash(unsandboxed(
+            &format!("touch {}", marker.display()),
+            Some(150),
+            false,
+        ))
+        .expect("a late deadline is a timeout");
+        let elapsed = started.elapsed();
+        let ran = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+
+        assert!(output.interrupted, "{}", output.stderr);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert!(!ran, "the command ran after the deadline");
+        assert_eq!(
+            crate::contain::release_count(),
+            0,
+            "the release byte was written after the deadline"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(350),
+            "returned after {elapsed:?}, before the post-ack deadline check"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "returned after {elapsed:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_failure_names_the_failing_step() {
+        let _guard = crate::test_env_lock();
+        let _inject = crate::contain::inject_close_failure();
+        let marker = std::env::temp_dir().join(unique_token("close-fail"));
+        let _ = std::fs::remove_file(&marker);
+        let error = execute_bash(unsandboxed(
+            &format!("touch {}", marker.display()),
+            Some(2_000),
+            false,
+        ))
+        .expect_err("a failed descriptor close must refuse the command");
+
+        assert!(
+            !marker.exists(),
+            "the command ran without closing inherited fds"
+        );
+        assert_eq!(crate::contain::release_count(), 0);
+        let text = error.to_string();
+        assert!(
+            text.contains("failed to close inherited descriptors"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("parent-death"),
+            "close failure was blamed on parent-death: {text}"
+        );
+        assert!(text.contains("refusing to start"), "{text}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn release_waits_for_the_parent_death_ack() {
         let _guard = crate::test_env_lock();
         let _inject = crate::contain::inject_arming_failure();
@@ -913,7 +1070,7 @@ os._exit(0)
         assert!(
             error
                 .to_string()
-                .contains("did not arm parent-death signal"),
+                .contains("failed to arm parent-death signal"),
             "{error}"
         );
         assert!(error.to_string().contains("refusing to start"), "{error}");
