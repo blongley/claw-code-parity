@@ -457,14 +457,20 @@ fn subreaper_supervisor_available() -> bool {
 
 /// Absolute path to the Rust subreaper. Never resolved through `PATH`.
 fn supervisor_program() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("CLAWD_BASH_SUPERVISOR") {
-        let path = PathBuf::from(path);
-        if path.is_absolute() && path.is_file() {
+    // `cargo test` exposes the real binary to integration tests. Unit tests
+    // find the same file next to `target/debug` once that build has run.
+    for key in ["CLAWD_BASH_SUPERVISOR", "CARGO_BIN_EXE_bash-supervisor"] {
+        if let Some(path) = absolute_executable(env::var_os(key)) {
             return Some(path);
         }
     }
     let exe = env::current_exe().ok()?;
     supervisor_beside(&exe).or_else(|| supervisor_beside(&exe.canonicalize().ok()?))
+}
+
+fn absolute_executable(path: Option<impl AsRef<OsStr>>) -> Option<PathBuf> {
+    let path = PathBuf::from(path?.as_ref());
+    (path.is_absolute() && path.is_file()).then_some(path)
 }
 
 fn supervisor_beside(exe: &std::path::Path) -> Option<PathBuf> {
